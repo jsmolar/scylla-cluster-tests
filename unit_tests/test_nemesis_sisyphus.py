@@ -13,6 +13,8 @@ def test_list_all_available_nemesis(generate_file=True):
 
     class_properties, method_properties = registry.gather_properties()
     sorted_dict = dict(sorted(method_properties.items(), key=lambda d: d[0]))
+    assert len(disruption_list) == 94
+
     if generate_file:
         with open(sct_abs_path('data_dir/nemesis.yml'), 'w', encoding="utf-8") as outfile1:
             yaml.dump(sorted_dict, outfile1, default_flow_style=False)

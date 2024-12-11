@@ -22,12 +22,17 @@
 - DrainKubernetesNodeThenDecommissionAndAddScyllaNode
 - DrainKubernetesNodeThenReplaceScyllaNode
 - DrainerMonkey
+- DropMonkey
 - EnableDisableTableEncryptionAwsKmsProviderWithRotationMonkey
 - EnableDisableTableEncryptionAwsKmsProviderWithoutRotationMonkey
 - EndOfQuotaNemesis
 - EnospcAllNodesMonkey
 - EnospcMonkey
+- GrowClusterNemesis
+- GrowFillNemesis
 - GrowShrinkClusterNemesis
+- GrowShrinkZeroTokenNode
+- GrowShrinkDatacenterNemesis
 - GrowShrinkZeroTokenNode
 - HardRebootNodeMonkey
 - IsolateNodeWithIptableRuleNemesis
