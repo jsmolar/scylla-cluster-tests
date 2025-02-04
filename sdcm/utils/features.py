@@ -75,8 +75,8 @@ def is_consistent_topology_changes_feature_enabled(session: Session) -> bool:
     return CONSISTENT_TOPOLOGY_CHANGES_FEATURE in get_enabled_features(session)
 
 
-def is_tablets_feature_enabled(session: Session) -> bool:
+def is_tablets_feature_enabled(node) -> bool:
     """ Check whether tablets enabled
-    if you need from a specific node use `patient_exclusive_cql_connection` session
     """
-    return TABLETS_FEATURE in get_enabled_features(session)
+    with node.remote_scylla_yaml() as scylla_yaml:
+        return scylla_yaml.enable_tablets

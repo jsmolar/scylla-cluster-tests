@@ -1044,7 +1044,7 @@ class BaseNode(AutoSshContainerMixin):  # pylint: disable=too-many-instance-attr
         elif not isinstance(self.parent_cluster.params, SCTConfiguration):
             TestFrameworkEvent(source=self.__class__.__name__,
                                message=f"The 'params' attribute expected to by 'SCTConfiguration`, "
-                                       f"but actually it is a `{type(self.parent_cluster.params)}`",
+                               f"but actually it is a `{type(self.parent_cluster.params)}`",
                                trace=sys._getframe().f_back,  # pylint: disable=protected-access
                                severity=Severity.ERROR).publish()
 
@@ -1675,7 +1675,7 @@ class BaseNode(AutoSshContainerMixin):  # pylint: disable=too-many-instance-attr
                 )
             )
             ScyllaYamlUpdateEvent(node_name=self.name, message=f"ScyllaYaml has been changed on node: {self.name}. "
-                                                               f"Diff: {diff}").publish()
+                                  f"Diff: {diff}").publish()
 
     def remote_manager_yaml(self):
         return self._remote_yaml(path=SCYLLA_MANAGER_YAML_PATH)
@@ -4769,7 +4769,7 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
             gce_pd_ssd_disk_size_db = self.params.get('gce_pd_ssd_disk_size_db')
             if not (gce_n_local_ssd_disk_db > 0 and gce_pd_ssd_disk_size_db > 0):
                 msg = f"Hybrid RAID cannot be configured without NVMe ({gce_n_local_ssd_disk_db}) " \
-                      f"and PD-SSD ({gce_pd_ssd_disk_size_db})"
+                    f"and PD-SSD ({gce_pd_ssd_disk_size_db})"
                 raise ValueError(msg)
 
             # The script to configure a hybrid RAID is named "hybrid_raid.py" and located on the private repository.
@@ -5070,10 +5070,9 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
 
     def decommission(self, node: BaseNode, timeout: int | float = None) -> DataCenterTopologyRfControl | None:
         if not node._is_zero_token_node:
-            with node.parent_cluster.cql_connection_patient(node) as session:
-                if tablets_enabled := is_tablets_feature_enabled(session):
-                    dc_topology_rf_change = DataCenterTopologyRfControl(target_node=node)
-                    dc_topology_rf_change.decrease_keyspaces_rf()
+            if tablets_enabled := is_tablets_feature_enabled(node):
+                dc_topology_rf_change = DataCenterTopologyRfControl(target_node=node)
+                dc_topology_rf_change.decrease_keyspaces_rf()
         with adaptive_timeout(operation=Operations.DECOMMISSION, node=node):
             node.run_nodetool("decommission", timeout=timeout, long_running=True, retry=0)
         self.verify_decommission(node)
@@ -5728,7 +5727,7 @@ class BaseMonitorSet:  # pylint: disable=too-many-public-methods,too-many-instan
                     # NOTE: monitoring-4.7 expects that node export metrics are part of exactly the "node_export" job
                     if scrape_config.get("job_name", "unknown") != job_name:
                         continue
-                    if "static_configs" not in base_scrape_configs[i]:
+                    if "static_configs" not in scrape_config:
                         base_scrape_configs[i]["static_configs"] = []
                     base_scrape_configs[i]["static_configs"] += static_config_list
                     break
