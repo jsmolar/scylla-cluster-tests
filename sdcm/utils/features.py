@@ -16,7 +16,6 @@ from cassandra.cluster import Session  # pylint: disable=no-name-in-module
 
 CONSISTENT_TOPOLOGY_CHANGES_FEATURE = "SUPPORTS_CONSISTENT_TOPOLOGY_CHANGES"
 CONSISTENT_CLUSTER_MANAGEMENT_FEATURE = "SUPPORTS_RAFT_CLUSTER_MANAGEMENT"
-TABLETS_FEATURE = "TABLETS"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,8 +74,16 @@ def is_consistent_topology_changes_feature_enabled(session: Session) -> bool:
     return CONSISTENT_TOPOLOGY_CHANGES_FEATURE in get_enabled_features(session)
 
 
-def is_tablets_feature_enabled(session: Session) -> bool:
+def is_tablets_feature_enabled(node) -> bool:
     """ Check whether tablets enabled
-    if you need from a specific node use `patient_exclusive_cql_connection` session
     """
-    return TABLETS_FEATURE in get_enabled_features(session)
+    result = False
+    with node.remote_scylla_yaml() as scylla_yaml:
+        if "tablets" in scylla_yaml.experimental_features:
+            result = True
+        if scylla_yaml.enable_tablets:
+            result = True
+
+    LOGGER.info(f"AAAAAAAAA: {scylla_yaml.abcdefgh}")
+    LOGGER.debug(f"Tablets are enabled: {result}, for node {node}")
+    return result
