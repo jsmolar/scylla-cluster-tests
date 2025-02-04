@@ -1009,6 +1009,11 @@ class Nemesis:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                 "Not supported on K8S. "
                 "Run 'disrupt_nodetool_flush_and_reshard_on_kubernetes' instead")
 
+        # If tablets in use, skipping resharding since it is not supported.
+        if is_tablets_feature_enabled(self.target_node):
+            if SkipPerIssues('https://github.com/scylladb/scylladb/issues/16739', params=self.tester.params):
+                raise UnsupportedNemesis('https://github.com/scylladb/scylladb/issues/16739')
+
         murmur3_partitioner_ignore_msb_bits = 15  # pylint: disable=invalid-name
         self.log.info(f'Restart node with resharding. New murmur3_partitioner_ignore_msb_bits value: '
                       f'{murmur3_partitioner_ignore_msb_bits}')

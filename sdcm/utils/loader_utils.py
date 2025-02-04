@@ -18,6 +18,8 @@ import time
 
 from sdcm.sct_events import Severity
 from sdcm.sct_events.system import TestFrameworkEvent
+from functools import cached_property
+from sdcm.utils.features import is_tablets_feature_enabled
 
 DEFAULT_USER = "cassandra"
 DEFAULT_USER_PASSWORD = "cassandra"
@@ -79,6 +81,11 @@ class LoaderUtilsMixin:
                 params = {'keyspace_num': keyspace_num, 'stress_cmd': stress_cmd,
                           'round_robin': self.params.get('round_robin')}
                 self._run_all_stress_cmds(stress_queue, params)
+
+    @cached_property
+    def tablets_enabled(self):
+        # is tablets feature enabled in Scylla configuration.
+        return is_tablets_feature_enabled(self.db_cluster.nodes[0])
 
     def _run_all_stress_cmds(self, stress_queue, params):
         stress_cmds = params['stress_cmd']

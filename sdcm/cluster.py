@@ -4839,6 +4839,7 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
             node.run_nodetool("decommission", timeout=timeout, long_running=True, retry=0)
         self.verify_decommission(node)
 
+
     @property
     def scylla_manager_node(self) -> BaseNode:
         return self.test_config.tester_obj().monitors.nodes[0]

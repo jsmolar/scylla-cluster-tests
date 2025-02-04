@@ -3175,6 +3175,23 @@ class FillDatabaseData(ClusterTester):
             version_with_support = self.NON_FROZEN_SUPPORT_OS_MIN_VERSION
         return self.parsed_scylla_version >= version_with_support
 
+    @property
+    def enable_cdc_for_tables(self) -> bool:
+        if self.tablets_enabled and SkipPerIssues(issues="https://github.com/scylladb/scylladb/issues/16317", params=self.params):
+            return False
+        return True
+
+    @property
+    def is_counter_supported(self) -> bool:
+        if self.tablets_enabled and SkipPerIssues(issues="scylladb/scylladb#18180", params=self.params):
+            return False
+        return True
+
+    @property
+    def tablets_enabled(self) -> bool:
+        """Check is tablets enabled on cluster"""
+        return is_tablets_feature_enabled(self.db_cluster.nodes[0])
+
     def version_cdc_support(self):
         if self.is_enterprise:
             version_with_support = self.CDC_SUPPORT_MIN_ENTERPRISE_VERSION
