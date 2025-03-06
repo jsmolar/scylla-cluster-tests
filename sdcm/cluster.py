@@ -103,6 +103,7 @@ from sdcm.utils.common import (
     prepare_and_start_saslauthd_service,
     raise_exception_in_thread,
     get_sct_root_path,
+    ParallelObject,
 )
 from sdcm.utils.context_managers import DbNodeLogger
 from sdcm.utils.ci_tools import get_test_name
@@ -166,7 +167,8 @@ from sdcm.exceptions import (
     NodeNotReady,
     SstablesNotFound,
 )
-from sdcm.utils.replication_strategy_utils import ReplicationStrategy, DataCenterTopologyRfControl
+from sdcm.utils.replication_strategy_utils import ReplicationStrategy, DataCenterTopologyRfControl, \
+    NetworkTopologyReplicationStrategy
 
 # Test duration (min). Parameter used to keep instances produced by tests that
 # are supposed to run longer than 24 hours from being killed
@@ -5126,6 +5128,37 @@ class BaseScyllaCluster:  # pylint: disable=too-many-public-methods, too-many-in
         if node._is_zero_token_node:
             return None
         return dc_topology_rf_change if tablets_enabled else None
+
+    def decommission_nodes(self, nodes: list[BaseNode]):
+        if self.parallel_node_operations:
+            self.log.debug(f"Starting parallel decommission of nodes: {nodes}")
+            num_workers = None if (self.parallel_node_operations and nodes[0].raft.is_enabled) else 1
+            parallel_obj = ParallelObject(objects=nodes, timeout=MAX_TIME_WAIT_FOR_DECOMMISSION,
+                                          num_workers=num_workers)
+            parallel_obj.run(self.decommission, ignore_exceptions=False, unpack_objects=True)
+        else:
+            self.log.debug(f"Starting sequential decommission of nodes: {nodes}")
+            for node in nodes:
+                self.decommission(node)
+
+    def dc_remove(self, nodes: list[BaseNode], keyspaces: list[str]):
+        """
+        Removes data-center from the cluster.
+
+        :param nodes: A list of nodes in the data center to be decommissioned.
+        :param keyspaces: A list of keyspaces that will have their replication factor set to 0,
+                          to no longer replicate data the decommissioned data-center.
+        """
+        # for node in nodes:
+        #     node.run_nodetool(sub_cmd="repair -pr", publish_event=True)
+
+        for keyspace in keyspaces:
+            strategy = ReplicationStrategy.get(nodes[0], keyspace)
+            if isinstance(strategy, NetworkTopologyReplicationStrategy):
+                strategy.replication_factors_per_dc[nodes[0].datacenter] = 0
+                strategy.apply(nodes[0], keyspace)
+
+        self.decommission_nodes(nodes)
 
     @property
     def scylla_manager_node(self) -> BaseNode:
