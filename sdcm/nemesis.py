@@ -4278,18 +4278,18 @@ class Nemesis:
         for cluster_node in self.cluster.data_nodes:
             cluster_node.run_nodetool(sub_cmd="repair -pr", publish_event=True)
 
-        # add nodes to each dc
-        InfoEvent(message='Grow both DCs').publish()
-        add_nodes_number = self.tester.params.get('nemesis_add_node_cnt')
-        self._grow_cluster()
-        for _ in range(add_nodes_number):
-            nodes_on_new_dc += [self._add_new_node_in_new_dc()]
-        time.sleep(sleep_time_between_ops)
-
-        # remove the new dc
-        InfoEvent(message='Remove DC').publish()
-        for node in nodes_on_new_dc:
-            self.cluster.decommission(node)
+        # # add nodes to each dc
+        # InfoEvent(message='Grow both DCs').publish()
+        # add_nodes_number = self.tester.params.get('nemesis_add_node_cnt')
+        # self._grow_cluster()
+        # for _ in range(add_nodes_number):
+        #     nodes_on_new_dc += [self._add_new_node_in_new_dc()]
+        # time.sleep(sleep_time_between_ops)
+        #
+        # # remove the new dc
+        # InfoEvent(message='Remove DC').publish()
+        # for node in nodes_on_new_dc:
+        #     self.cluster.decommission(node)
 
     # NOTE: version limitation is caused by the following:
     #       - https://github.com/scylladb/scylla-enterprise/issues/3211
