@@ -157,6 +157,9 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):  # py
             self.log.debug('Next compaction strategy will be used %s', compaction_strategy)
             params['compaction_strategy'] = compaction_strategy
 
+        self.log.debug("Execute post prepare queries: %s", self.params.get('post_prepare_cql_cmds'))
+        self._run_cql_commands(self.params.get('post_prepare_cql_cmds'))
+
         for stress_cmd in population_commands:
             params.update({
                 'stress_cmd': stress_cmd,
