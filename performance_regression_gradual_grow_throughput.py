@@ -1,18 +1,20 @@
 import pathlib
 import time
-from enum import Enum
+from enum import Enum, auto
 from collections import defaultdict, Counter
 
 import json
 from dataclasses import dataclass, replace
 from typing import List, Union
 
+from mgmt_cli_test import ManagerTestFunctionsMixIn
 from performance_regression_test import PerformanceRegressionTest
+from sdcm.rest.raft_api import RaftApi
 from sdcm.utils.common import skip_optional_stage
 from sdcm.sct_events import Severity
 from sdcm.sct_events.system import TestFrameworkEvent
 from sdcm.results_analyze import PredefinedStepsTestPerformanceAnalyzer
-from sdcm.utils.decorators import latency_calculator_decorator
+from sdcm.utils.decorators import latency_calculator_decorator, optional_stage
 from sdcm.utils.latency import calculate_latency, analyze_hdr_percentiles
 
 
@@ -399,3 +401,127 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
 
         for stress in stress_queue:
             self.get_stress_results(queue=stress, store_results=False)
+
+
+class Compressions(Enum):
+    LZ4Compressor = auto()
+    LZ4WithDictsCompressor = auto()
+    ZstdCompressor = auto()
+    ZstdWithDictsCompressor = auto()
+
+
+class PerformanceCompression(PerformanceRegressionPredefinedStepsTest, ManagerTestFunctionsMixIn):
+
+    def get_restore_extra_parameters(self) -> str:
+        extra_params = self.params.get('mgmt_restore_extra_params')
+        return extra_params if extra_params else None
+
+    def calculate_size(self, table_names, log_string):
+        target_node = self.db_cluster.nodes[0]
+
+        for table_name in table_names:
+            a = target_node.run_nodetool(f"tablestats argus.{table_name}")
+            self.log.info(f"{log_string} Table with name {table_name} has stats {a}")
+
+    def recompress_tables(self, compression: Compressions, table_names):
+        with self.db_cluster.cql_connection_patient(self.db_cluster.nodes[0]) as session:
+            for table_name in table_names:
+                session.execute(f"ALTER TABLE argus.{table_name} "
+                                f"WITH compression = {{'sstable_compression': '{compression}'}}")
+
+
+        with self.db_cluster.cql_connection_patient(self.db_cluster.nodes[0]) as session:
+            self.log.info("Retraining compression dictionaries for all Argus tables")
+            for table_name in table_names:
+                start_time = time.monotonic()
+                # self.db_cluster.nodes[0].remoter.run(
+                #     f"curl -X POST 127.0.0.1:10000/storage_service/unset_compression_dictionary?keyspace=argus\&cf={table_name}"
+                # )
+                self.db_cluster.nodes[0].remoter.run(
+                    f"curl -X POST 127.0.0.1:10000/storage_service/retrain_dict?keyspace=argus\&cf={table_name}")
+                duration = time.monotonic() - start_time
+                self.log.info(f"Retraining dictionary for table '{table_name}' took {duration:.2f} seconds.")
+
+            self.log.info("Waiting for read_barrier")
+            for node in self.db_cluster.nodes:
+                start_time = time.monotonic()
+                group_id = session.execute("select value from system.scylla_local where key = 'raft_group0_id'").one().value
+                node.remoter.run(f"curl -v -X POST 127.0.0.1:10000/raft/read_barrier?group_id={group_id}")
+                duration = time.monotonic() - start_time
+                self.log.info(f"Waiting for read barrier {duration:.2f} seconds.")
+
+        for node in self.db_cluster.nodes:
+            # NOTE: 'flush' is needed in case there are no sstables yet
+            a = node.run_nodetool("flush -- argus", verbose=True)
+            self.log.info(f"Nodetool flush argus result: {a}")
+            # NOTE: 'flush' is needed for system_schema, to make sure the new table info
+            # is on disk, `scylla sstable` reads only from disk
+            a = node.run_nodetool("flush -- system_schema", verbose=True)
+            self.log.info(f"Nodetool flush system schema result: {a}")
+            time.sleep(2)
+            node.run_nodetool("upgradesstables -a -- argus", verbose=True)
+
+
+        self.calculate_size(table_names, f"Compression:  {compression}")
+
+
+    @optional_stage('perf_preload_data')
+    def preload_data(self, compaction_strategy=None):
+        """The test restores the schema and data from a pre-created backup and runs the verification read stress.
+                1. Define the backup to restore from
+                2. Run restore schema to empty cluster
+                3. Run restore data
+                4. Run verification read stress
+
+                Args:
+                    snapshot_name: The name of the snapshot to restore from.
+                                   All snapshots are defined in the 'defaults/manager_restore_benchmark_snapshots.yaml'
+                    restore_outside_manager: set True to restore outside of Manager via nodetool refresh
+                """
+        self.log.info("Initialize Scylla Manager")
+        mgr_cluster = self.db_cluster.get_cluster_manager()
+
+        self.log.info("Define snapshot details and location")
+        snapshot_data = self.get_snapshot_data("argus_bkb")
+        locations = snapshot_data.locations
+
+        self.log.info("Restoring the schema")
+        task = self.restore_backup_with_task(mgr_cluster=mgr_cluster, snapshot_tag=snapshot_data.tag, timeout=1200,
+                                             restore_schema=True, location_list=locations)
+        self.log.info(f"Schema restored: {task}")
+
+        for node in self.db_cluster.nodes:
+            node.run_nodetool("disableautocompaction")
+
+        self.log.info("Restoring the data with standard L&S approach")
+        extra_params = "--keyspace '*,!system_distributed.cdc_generation_descriptions'"
+        task = self.restore_backup_with_task(mgr_cluster=mgr_cluster, snapshot_tag=snapshot_data.tag,
+                                             timeout=1200, restore_data=True,
+                                             location_list=locations, extra_params=extra_params)
+        self.log.info(f"Tablets restored: {task}")
+
+        with self.db_cluster.cql_connection_patient(self.db_cluster.nodes[0]) as session:
+            table_names = self.get_tables_name_of_keyspace(session, "argus")
+            self.log.info(f"TABLE NAMES aaa: {table_names}")
+
+        self.calculate_size(table_names, "Compression:  LZ4Compressor")
+
+        self.recompress_tables(Compressions.LZ4WithDictsCompressor.name, table_names)
+
+        self.recompress_tables(Compressions.ZstdCompressor.name, table_names)
+
+        self.recompress_tables(Compressions.ZstdWithDictsCompressor.name, table_names)
+
+        self.log.info("ENDEEEEEE SLUUUUUS")
+    #     restore_time = task.duration
+    #     manager_version_timestamp = mgr_cluster.sctool.client_version_timestamp
+    #     self._send_restore_results_to_argus(task, manager_version_timestamp, dataset_label=snapshot_name)
+    #
+    # self.manager_test_metrics.restore_time = restore_time
+    #
+    # if not (self.params.get('mgmt_skip_post_restore_stress_read') or snapshot_data.prohibit_verification_read):
+    #     self.log.info("Running verification read stress")
+    #     cs_verify_cmds = self.build_cs_read_cmd_from_snapshot_details(snapshot_data)
+    #     self.run_and_verify_stress_in_threads(cs_cmds=cs_verify_cmds)
+    # else:
+    #     self.log.info("Skipping verification read stress because of the test or snapshot configuration")

@@ -26,4 +26,4 @@ class RaftApi(RemoteCurlClient):
         path = f"read_barrier?group_id={group_id}"
         return self.run_remoter_curl(method="POST",
                                      path=path,
-                                     params={}, timeout=30).stdout.strip()
+                                     params={}, timeout=300).stdout.strip()

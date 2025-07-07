@@ -33,6 +33,7 @@ from sdcm.mgmt.common import \
     TaskStatus, ScyllaManagerError, HostStatus, HostSsl, HostRestStatus, duration_to_timedelta, DEFAULT_TASK_TIMEOUT
 from sdcm.provision.helpers.certificate import TLSAssets
 from sdcm.utils.context_managers import DbNodeLogger
+from sdcm.utils.decorators import retrying
 from sdcm.wait import WaitForTimeoutError
 
 LOGGER = logging.getLogger(__name__)
@@ -275,6 +276,7 @@ class ManagerTask:
                 break
         return arguments_string
 
+    @retrying(n=10, sleep_time=10, allowed_exceptions=ScyllaManagerError, message="retrying stupid progress")
     def progress_string(self, **kwargs):
         """
         The function executes the progress command for the current task
@@ -304,6 +306,7 @@ class ManagerTask:
         else:
             cmd = f" -c {self.cluster_id} task progress {self.id}"
         res = self.sctool.run(cmd=cmd, **kwargs)
+
         return res
 
     @property
@@ -621,6 +624,7 @@ class ManagerCluster(ScyllaManagerBase):
         if extra_params:
             cmd += f" {extra_params}"
 
+        LOGGER.debug(f"Running cmd: {cmd}")
         res = self.sctool.run(cmd=cmd, parse_table_res=False)
         task_id = res.stdout.strip()
         LOGGER.debug("Created task id is: {}".format(task_id))

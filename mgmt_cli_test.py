@@ -429,8 +429,7 @@ class BucketOperations(ClusterTester):
 class SnapshotOperations(ClusterTester):
 
     @staticmethod
-    def get_snapshot_data(snapshot_name: str) -> SnapshotData:
-        snapshots_config = "defaults/manager_restore_benchmark_snapshots.yaml"
+    def get_snapshot_data(snapshot_name: str, snapshots_config: str = "defaults/manager_restore_benchmark_snapshots.yaml") -> SnapshotData:
         with open(snapshots_config, encoding="utf-8") as snapshots_yaml:
             all_snapshots_dict = yaml.safe_load(snapshots_yaml)
 
@@ -757,7 +756,7 @@ class ManagerTestFunctionsMixIn(
                                                        location_list=location_list, snapshot_tag=snapshot_tag,
                                                        dc_mapping=dc_mapping, extra_params=extra_params)
         restore_task.wait_and_get_final_status(step=30, timeout=timeout)
-        assert restore_task.status == TaskStatus.DONE, f"Restoration of {snapshot_tag} has failed!"
+        assert restore_task.status == TaskStatus.DONE, f"Restoration of {snapshot_tag} has failed! With status {restore_task}"
         InfoEvent(message=f'The restore task has ended successfully. '
                   f'Restore run time: {restore_task.duration}.').publish()
         if restore_schema:

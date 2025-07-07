@@ -2880,7 +2880,8 @@ class ClusterTester(db_stats.TestStatsMixin, unittest.TestCase):
     def get_tables_name_of_keyspace(self, session, keyspace_name):
         query = "SELECT table_name FROM system_schema.tables WHERE keyspace_name='{}' ".format(keyspace_name)
         table_id = self.rows_to_list(session.execute(query))
-        return table_id[0]
+        self.log.info(f"TABLES METHOD: {[item[0] for item in table_id]}")
+        return [item[0] for item in table_id]
 
     def get_truncated_time_from_system_local(self, session):
         query = "SELECT truncated_at FROM system.local"
