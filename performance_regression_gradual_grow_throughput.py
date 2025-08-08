@@ -506,22 +506,38 @@ class PerformanceCompression(PerformanceRegressionPredefinedStepsTest, ManagerTe
 
         self.calculate_size(table_names, "Compression:  LZ4Compressor")
 
-        self.recompress_tables(Compressions.LZ4WithDictsCompressor.name, table_names)
-
-        self.recompress_tables(Compressions.ZstdCompressor.name, table_names)
-
-        self.recompress_tables(Compressions.ZstdWithDictsCompressor.name, table_names)
+        # self.recompress_tables(Compressions.LZ4WithDictsCompressor.name, table_names)
+        #
+        # self.recompress_tables(Compressions.ZstdCompressor.name, table_names)
+        #
+        # self.recompress_tables(Compressions.ZstdWithDictsCompressor.name, table_names)
 
         self.log.info("ENDEEEEEE SLUUUUUS")
-    #     restore_time = task.duration
-    #     manager_version_timestamp = mgr_cluster.sctool.client_version_timestamp
-    #     self._send_restore_results_to_argus(task, manager_version_timestamp, dataset_label=snapshot_name)
-    #
-    # self.manager_test_metrics.restore_time = restore_time
-    #
-    # if not (self.params.get('mgmt_skip_post_restore_stress_read') or snapshot_data.prohibit_verification_read):
-    #     self.log.info("Running verification read stress")
-    #     cs_verify_cmds = self.build_cs_read_cmd_from_snapshot_details(snapshot_data)
-    #     self.run_and_verify_stress_in_threads(cs_cmds=cs_verify_cmds)
-    # else:
-    #     self.log.info("Skipping verification read stress because of the test or snapshot configuration")
+
+    def test_write_latte(self):
+        """
+        Test steps:
+
+        1. Run a write workload
+        """
+
+        # run a write workload
+        base_cmd_w = self.params.get('stress_cmd_w')
+
+        # create new document in ES with doc_id = test_id + timestamp
+        # allow to correctly save results for future compare
+        self.create_test_stats(doc_id_with_timestamp=True)
+        self.run_fstrim_on_all_db_nodes()
+
+        self.preload_data()
+
+        # run a workload
+        self.log.info("Running latte workload")
+        stress_queue = self.run_stress_thread(
+            stress_cmd=base_cmd_w, stats_aggregate_cmds=False)
+        results = self.get_stress_results(queue=stress_queue)
+
+        self.build_histogram(stress_queue.stress_operation, hdr_tags=stress_queue.hdr_tags)
+        self.update_test_details(scylla_conf=True)
+        self.display_results(results, test_name='test_write')
+        self.check_regression()

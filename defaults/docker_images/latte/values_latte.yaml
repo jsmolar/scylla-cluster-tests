@@ -1,2 +1,2 @@
 latte:
-  image: scylladb/latte:0.31.1-scylladb
+  image: vponomarovatscylladb/hydra-loaders:0.32.0-scylladb-return-data

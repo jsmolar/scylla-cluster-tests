@@ -1,0 +1,30 @@
+use latte::*;
+
+const ROW_COUNT = latte::param!("row_count", 10);
+const INSERT = "my_insert";
+const SELECT = "my_select";
+
+pub async fn prepare(db) {
+    db.prepare(SELECT, `SELECT id FROM argus.pytest_result_table LIMIT ${ROW_COUNT}`).await?;
+}
+
+pub async fn run(db, i) {
+    //let response = db.execute_prepared(SELECT, [ROW_COUNT]).await;
+    let response = db.execute(`SELECT * FROM argus.pytest_result_table LIMIT 10`).await;
+
+    match response {
+        Ok(rows) => {
+            println!("Raw response: {:?}", rows);
+            if rows.is_empty() {
+                println!("No rows returned.");
+            } else {
+                for row in rows {
+                    println!("Row: {:?}", row);
+                }
+            }
+        }
+        Err(e) => {
+            println!("Execution failed: {}", e);
+        }
+    }
+}
