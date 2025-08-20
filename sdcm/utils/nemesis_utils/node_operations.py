@@ -70,7 +70,8 @@ def block_loaders_payload_for_scylla_node(scylla_node: BaseNode, loader_nodes: l
 
 
 def is_node_removed_from_cluster(removed_node: BaseNode, verification_node: BaseNode) -> bool:
-    LOGGER.debug("Verification node %s", verification_node.name)
+    LOGGER.debug("Checking if node %s is removed from cluster using verification node %s",
+                 removed_node.name, verification_node.name)
     cluster_status: Optional[dict] = removed_node.parent_cluster.get_nodetool_status(
         verification_node=verification_node)
     if not cluster_status:
@@ -82,7 +83,8 @@ def is_node_removed_from_cluster(removed_node: BaseNode, verification_node: Base
 
 
 def is_node_seen_as_down(down_node: BaseNode, verification_node: BaseNode) -> bool:
-    LOGGER.debug("Verification node %s", verification_node.name)
+    LOGGER.debug("Checking if node %s is seen as down using verification node %s",
+                 down_node.name, verification_node.name)
     nodes_status = verification_node.parent_cluster.get_nodetool_status(verification_node, dc_aware=False)
     down_node_status = nodes_status.get(down_node.ip_address)
-    return (not down_node_status or down_node_status["state"] == "DN")
+    return not down_node_status or down_node_status["state"] == "DN"

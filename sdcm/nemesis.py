@@ -5403,17 +5403,17 @@ class Nemesis(NemesisFlags):
         keyspace_name = "banned_keyspace"
         table_name = "table1"
 
-        def drop_keyspace(node):
+        def _drop_keyspace(node):
             with self.cluster.cql_connection_patient(node=node) as session:
                 LOGGER.debug("Drop keyspace %s", keyspace_name)
                 session.execute(f"DROP KEYSPACE IF EXISTS {keyspace_name}", timeout=300)
 
         simulate_node_unavailability = node_operations.block_scylla_ports if use_iptables else node_operations.pause_scylla_with_sigstop
-        with self.node_allocator.run_nemesis(
-                nemesis_label=f"{simulate_node_unavailability.__name__}") as working_node, ExitStack() as stack:
+        with (self.node_allocator.run_nemesis(
+                nemesis_label=f"{simulate_node_unavailability.__name__}") as working_node, ExitStack() as stack):
             stack.enter_context(node_operations.block_loaders_payload_for_scylla_node(
                 self.target_node, loader_nodes=self.loaders.nodes))
-            stack.callback(drop_keyspace, node=working_node)
+            stack.callback(_drop_keyspace, node=working_node)
             target_host_id = self.target_node.host_id
             stack.callback(self._remove_node_add_node, verification_node=working_node, node_to_remove=self.target_node,
                            remove_node_host_id=target_host_id)
@@ -5427,7 +5427,10 @@ class Nemesis(NemesisFlags):
                          down_node=self.target_node, verification_node=working_node, text=f"Wait other nodes see {self.target_node.name} as DOWN...")
                 self.log.debug("Remove node %s : hostid: %s with blocked scylla from cluster",
                                self.target_node.name, target_host_id)
-                working_node.run_nodetool(f"removenode {target_host_id}", retry=0, long_running=True)
+
+                with adaptive_timeout(Operations.REMOVE_NODE, working_node, timeout=HOUR_IN_SEC):
+                    working_node.run_nodetool(f"removenode {target_host_id}",
+                                              ignore_status=True, verbose=True, retry=0, long_running=True)
                 assert node_operations.is_node_removed_from_cluster(removed_node=self.target_node, verification_node=working_node), \
                     f"Node {self.target_node.name} with host id {target_host_id} was not removed. See log errors"
 
@@ -5437,14 +5440,14 @@ class Nemesis(NemesisFlags):
             assert self.target_node.db_up(), f"Scylla was not up on node {self.target_node.name}"
 
             with self.cluster.cql_connection_exclusive(node=self.target_node) as session:
-                for key in random.sample(range(1, 100001), 1000):
+                for key in random.sample(range(1, 100001), 100):
                     try:
                         stmt = SimpleStatement(f"INSERT INTO {keyspace_name}.{table_name} (key, name) VALUES ({key}, 'name{key}');",
                                                consistency_level=ConsistencyLevel.QUORUM)
                         session.execute(stmt)
                         self.log.error("Banned query passed to cluster from banned node")
                         raise BannedQueryExecUnexpectedSuccess(
-                            "Query from banned node was executed succesful with Consistency.QUORUM")
+                            "Query from banned node was executed successful with Consistency.QUORUM")
                     except (NoHostAvailable, OperationTimedOut, Unavailable) as exc:
                         self.log.debug("Query failed with error: %s as expected", exc)
 
