@@ -27,5 +27,5 @@ queries:
     cql: INSERT INTO keyspace1.standard1 (key) VALUES (?);
     fields: samerow
   read:
-    cql: SELECT key FROM keyspace1.standard1 WHERE key = ?;
+    cql: SELECT key FROM keyspace1.standard1 WHERE key = ? BYPASS CACHE;
     fields: samerow

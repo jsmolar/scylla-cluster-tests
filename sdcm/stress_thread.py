@@ -121,12 +121,13 @@ class CassandraStressThread(DockerBasedStressThread):
             else:
                 raise ValueError(
                     "Cannot detect supported stress operation type from the stress command with user profile: %s", stress_cmd)
-        elif " mixed " in stress_cmd:
-            self.hdr_tags = [f"WRITE-{tag_suffix}", f"READ-{tag_suffix}"]
-        elif " read " in stress_cmd:
-            self.hdr_tags = [f"READ-{tag_suffix}"]
         else:
-            self.hdr_tags = [f"WRITE-{tag_suffix}"]
+            if " mixed " in stress_cmd:
+                self.hdr_tags = [f"WRITE-{tag_suffix}", f"READ-{tag_suffix}"]
+            elif " read " in stress_cmd:
+                self.hdr_tags = [f"READ-{tag_suffix}"]
+            else:
+                self.hdr_tags = [f"WRITE-{tag_suffix}"]
 
     @staticmethod
     def append_no_warmup_to_cmd(stress_cmd):
