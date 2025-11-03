@@ -151,6 +151,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             # To address this, we will now verify that no tablet splits or merges are active by checking the system.tablets table.
             # The new condition for system idleness requires the resize_type column to be 'none' for all relevant tablets for a
             # continuous period of three minutes.
+            self.log.info("AAAAAAAAAAA")
             self.wait_for_no_tablets_splits()
             self.run_fstrim_on_all_db_nodes()
 
@@ -219,7 +220,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
 
         for stress in stress_queue:
             results.extend(self.get_stress_results(queue=stress, store_results=False))
-            self.log.debug("One c-s command results: %s", results[-1])
+            self.log.debug("One c-s command results: %s", results)
         # NOTE: 'stress_queue' will be used by the 'latency_calculator_decorator' decorator
         return results, stress_queue
 
@@ -287,6 +288,7 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
 
     # pylint: disable=too-many-arguments,too-many-locals
     def run_gradual_increase_load(self, workload: Workload, stress_num, num_loaders, test_name):  # noqa: PLR0914
+        self.log.info("AAAA")
         workload = self.update_num_threads_for_steps(workload=workload)
 
         if workload.cs_cmd_warm_up is not None:
@@ -295,16 +297,18 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             # Wait for 4 minutes after warmup to let for all background processes to finish
             time.sleep(240)
 
+        self.log.info("BBBBB")
         if not self.exists():
             self.log.debug("Create test statistics in ES")
             self.create_test_stats(sub_type=workload.workload_type, doc_id_with_timestamp=False)
         total_summary = {}
 
         sequential_steps = self.get_sequential_throttle_steps(workload)
+        self.log.info(f"SEQUENTIAL STEPS: {sequential_steps}")
         for throttle_step, num_threads, current_throttle_step in zip(workload.throttle_steps, workload.num_threads, sequential_steps):
             self.log.info("Run cs command with rate: %s Kops; threads: %s; step name: %s", throttle_step, num_threads,
                           current_throttle_step)
-            current_throttle = f"fixed={int(int(throttle_step) // (num_loaders * stress_num))}/s" if throttle_step != "unthrottled" else ""
+            current_throttle = f"{int(int(throttle_step) // (num_loaders * stress_num))}" if throttle_step != "unthrottled" else ""
             run_step = ((latency_calculator_decorator(legend=f"Gradual test step {current_throttle_step} op/s",
                                                       cycle_name=current_throttle_step))(self.run_step))
             results, _ = run_step(stress_cmds=workload.cs_cmd_tmpl, current_throttle=current_throttle,
