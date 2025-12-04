@@ -680,7 +680,7 @@ class ManagerCluster(ScyllaManagerBase):
 
     def create_repair_task(self, dc_list=None,
                            keyspace=None, interval=None, num_retries=None, fail_fast=None,
-                           intensity=None, parallel=None, cron=None, start_date=None):
+                           intensity=None, parallel=None, cron=None, start_date=None, ignore_down_hosts=False):
         # the interval string:
         # Amount of time after which a successfully completed task would be run again. Supported time units include:
         #
@@ -711,6 +711,8 @@ class ManagerCluster(ScyllaManagerBase):
         # TODO: remove start-date once 2.6 is no longer supported
         if cron is not None:
             cmd += " --cron '{}' ".format(" ".join(cron))
+        if ignore_down_hosts:
+            cmd += " --ignore-down-hosts"
 
         with DbNodeLogger([self.manager_node], f"start scylla-manager task {cmd}", target_node=self.manager_node):
             res = self.sctool.run(cmd=cmd, parse_table_res=False)
@@ -1326,7 +1328,8 @@ class SCTool:
         if column_name and column_name.upper() not in column_titles:
             raise ScyllaManagerError("Column name: {} not found in table: {}".format(column_name, parsed_table))
         column_name_index = column_titles.index(
-            column_name.upper()) if column_name else 1  # "1" is used in a case like "task progress" where no column names exist.
+            # "1" is used in a case like "task progress" where no column names exist.
+            column_name.upper()) if column_name else 1
         ret_val = 'N/A'
         for row in parsed_table:
             if is_search_substring:
