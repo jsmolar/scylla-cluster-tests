@@ -371,6 +371,7 @@ class PerformanceRegressionTest(ClusterTester, loader_utils.LoaderUtilsMixin):
                 nemesis=self.get_nemesis_class(), tester_obj=self, hdr_tags=stress_queue.hdr_tags
             )
             self.db_cluster.start_nemesis(interval=interval, cycles_count=1)
+            time.sleep(36000)
             self._stop_load_when_nemesis_threads_end()
         results = self.get_stress_results(queue=stress_queue)
         self.update_test_details(scrap_metrics_step=60)

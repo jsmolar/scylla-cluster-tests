@@ -162,6 +162,9 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         self.run_prepare_write_cmd()
 
+        stress_cmd = self.params.get("stress_cmd")
+        self.assemble_and_run_all_stress_cmd(stress_queue, stress_cmd, keyspace_num)
+
         # Grow cluster to target size if requested
         if cluster_target_size := self.params.get("cluster_target_size"):
 
@@ -211,9 +214,6 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         # Collect data about partitions and their rows amount
         if self.partitions_attrs and self.partitions_attrs.validate_partitions:
             self.partitions_attrs.collect_initial_partitions_info()
-
-        stress_cmd = self.params.get("stress_cmd")
-        self.assemble_and_run_all_stress_cmd(stress_queue, stress_cmd, keyspace_num)
 
         customer_profiles = self.params.get("cs_user_profiles")
         if customer_profiles:

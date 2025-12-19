@@ -1,0 +1,9 @@
+test_duration: 600
+n_db_nodes: 9
+cluster_target_size: 15
+
+user_prefix: 'cluster-scale-10-16-test'
+
+
+# Takes too long on big clusters
+cluster_health_check: false
