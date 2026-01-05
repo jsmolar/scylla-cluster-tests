@@ -126,6 +126,7 @@ from sdcm.utils.common import (
     change_default_password,
     parse_python_thread_command,
     get_data_dir_path,
+    get_sct_root_path,
 )
 from sdcm.utils.parallel_object import ParallelObject
 from sdcm.utils.cql_utils import cql_quote_if_needed
@@ -2083,6 +2084,26 @@ class ClusterTester(db_stats.TestStatsMixin, unittest.TestCase):
             else:
                 raise NotImplementedError(f"{kafka_backend=} not implemented")
 
+    def get_pykmip(self):
+        # node.remoter.sudo("sudo groupadd -r scylla || true && sudo useradd -r -g scylla scylla || true")
+        # install_encryption_at_rest_files(node.remoter)
+        remoter = LOCALRUNNER
+        path = Path(get_sct_root_path()) / "pykmip"
+        clone_repo(
+            remoter=remoter,
+            # repo_url="https://raw.githubusercontent.com/jsmolar/PyKMIP/master/docker-compose.yaml",
+            repo_url="https://github.com/jsmolar/pykmip",
+            branch="master",
+            destination_dir_name=str(path),
+            clone_as_root=False,
+        )
+        # remoter.sudo("apt install -y docker-compose-plugin")
+        # remoter.run(f"mkdir -p {path}/data/logs")
+
+        # remoter.sudo(f"chmod 777 {path}/pykmip/data/logs")
+        remoter.run(f"cd {path}; docker compose up -d --scale pykmip=10")
+        # node.remoter.run("docker compose logs pykmip")
+
     @staticmethod
     def _add_and_wait_for_cluster_nodes_in_parallel(clusters):
         def _add_and_wait_for_cluster_nodes(cluster):
@@ -2527,6 +2548,7 @@ class ClusterTester(db_stats.TestStatsMixin, unittest.TestCase):
             cluster_backend = "aws"
 
         self.get_cluster_kafka()
+        self.get_pykmip()
 
         if cluster_backend in ("aws", "aws-siren"):
             self.get_cluster_aws(loader_info=loader_info, db_info=db_info, monitor_info=monitor_info)

@@ -700,6 +700,13 @@ class BaseNode(AutoSshContainerMixin):
             for kms_host_name, kms_host_data in append_scylla_yaml.get("kms_hosts", {}).items():
                 if kms_host_data["aws_region"] == "auto":
                     append_scylla_yaml["kms_hosts"][kms_host_name]["aws_region"] = self.vm_region
+            if "kmip_hosts" in append_scylla_yaml:
+                monitor_ip = self.test_config.tester_obj().monitors.nodes[0].private_ip_address
+                for kmip_host_name in append_scylla_yaml["kmip_hosts"]:
+                    # Take first KMIP host and update with monitor node IP
+                    append_scylla_yaml["kmip_hosts"][kmip_host_name]["hosts"] = f"{monitor_ip}:5696"
+                    break  # Only update the first one
+
             scylla_yml.update(append_scylla_yaml)
         if self.parent_cluster.node_type == "oracle-db":
             scylla_yml.experimental_features = []  # Oracle Scylla does not use experimental features
@@ -5680,6 +5687,7 @@ class BaseScyllaCluster:
                 "io.conf before reboot: %s",
                 node.remoter.sudo(f"cat {node.add_install_prefix('/etc/scylla.d/io.conf')}").stdout,
             )
+
             node.start_scylla_server(verify_up=False)
             if self.params.get("jmx_heap_memory"):
                 node.restart_scylla_jmx()

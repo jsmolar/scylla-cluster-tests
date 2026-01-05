@@ -7017,15 +7017,15 @@ class MgmtBackupSpecificKeyspaces(Nemesis):
         self.disrupt_mgmt_backup_specific_keyspaces()
 
 
-class MgmtRestore(Nemesis):
-    manager_operation = True
-    disruptive = True
-    kubernetes = True
-    limited = True
-    supports_high_disk_utilization = False  # Snapshot/Restore operations consume disk space
-
-    def disrupt(self):
-        self.disrupt_mgmt_restore()
+# class MgmtRestore(Nemesis):
+#     manager_operation = True
+#     disruptive = True
+#     kubernetes = True
+#     limited = True
+#     supports_high_disk_utilization = False  # Snapshot/Restore operations consume disk space
+#
+#     def disrupt(self):
+#         self.disrupt_mgmt_restore()
 
 
 class MgmtRepair(Nemesis):
