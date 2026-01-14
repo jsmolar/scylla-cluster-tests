@@ -16,6 +16,10 @@ n_db_nodes: 6
 n_loaders: 1
 seeds_num: 3
 
+append_scylla_yaml:
+  auto_repair_enabled_default: true
+  auto_repair_threshold_default_in_seconds: 120
+
 instance_type_db: 'i4i.large'
 gce_instance_type_db: 'n2-highmem-2'
 gce_instance_type_loader: 'e2-standard-2'

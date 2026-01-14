@@ -27,3 +27,7 @@ sstable_size: 100
 
 hinted_handoff: 'enabled'
 parallel_node_operations: true
+
+append_scylla_yaml:
+  auto_repair_enabled_default: true
+  auto_repair_threshold_default_in_seconds: 120
