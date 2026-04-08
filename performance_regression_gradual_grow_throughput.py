@@ -222,7 +222,9 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
         num_loaders = len(self.loaders.nodes)
         self.run_fstrim_on_all_db_nodes()
         # run a write workload as a preparation
-        if workload.preload_data and not skip_optional_stage("perf_preload_data"):
+        if self.params.get('pre_create_keyspace'):
+            self._pre_create_keyspace()
+        if workload.preload_data and not skip_optional_stage('perf_preload_data'):
             self.preload_data()
             self.run_post_prepare_cql(workload=workload)
             self.wait_no_compactions_running(n=400, sleep_time=120)

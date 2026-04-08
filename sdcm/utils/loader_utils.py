@@ -232,6 +232,7 @@ class LoaderUtilsMixin:
             cmds = [cmds]
 
         for cmd in cmds:
+            self.log.debug(f"AAAA: {cmd}")
             with self.db_cluster.cql_connection_patient(node) as session:
                 session.execute(cmd)
 

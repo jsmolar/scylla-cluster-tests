@@ -4,14 +4,17 @@ test_duration: 500
 perf_stress_keyspace: keyspace1
 perf_stress_table: standard1
 
-# Define the commands to be used in the write-load test. The purpose of this command is to prepare the schema without hardcoded ks.table definition.
+pre_create_keyspace: [
+  "CREATE KEYSPACE keyspace1 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}  AND durable_writes = true AND storage = {'type': 'S3', 'endpoint': 's3.us-east-1.amazonaws.com', 'bucket': 'manager-backup-tests-us-east-1'};",
+]
+
 prepare_stress_cmd: "cassandra-stress write cl=ALL n=1 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate 'threads=1' -col 'size=FIXED(1024) n=FIXED(1)'"
 
 prepare_write_cmd: [
-    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=1..162500001",
-    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=162500002..325000002",
-    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=325000003..487500003",
-    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=487500004..650000004"
+    "cassandra-stress write  cl=ALL n=16250000 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate 'threads=1 fixed=2000/s' -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=1..162500001",
+#    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=162500002..325000002",
+#    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=325000003..487500003",
+#    "cassandra-stress write  cl=ALL n=162500001 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode connectionsPerHost=8 cql3 native -rate threads=50 throttle=37500/s -col 'size=FIXED(1024) n=FIXED(1)'  -pop seq=487500004..650000004"
 ]
 
 stress_cmd_w:  [
@@ -24,15 +27,15 @@ stress_cmd_w:  [
 stress_cmd_r: [
   "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000",
   "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=5000001..10000000",
-  "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=10000001..15000000",
-  "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=15000001..20000000"
+#  "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=10000001..15000000",
+#  "cassandra-stress read  cl=QUORUM duration=$duration -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads $throttle' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=15000001..20000000"
 ]
 
 stress_cmd_cache_warmup: [
   "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=1..5000000",
   "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=5000001..10000000",
-  "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=10000001..15000000",
-  "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=15000001..20000000"
+#  "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=10000001..15000000",
+#  "cassandra-stress read  cl=ALL n=5000000 -mode connectionsPerHost=8 cql3 native -rate 'threads=$threads' -col 'size=FIXED(1024) n=FIXED(1)' -pop seq=15000001..20000000"
 ]
 
 stress_cmd_m: [
@@ -53,7 +56,7 @@ stress_cmd_read_disk: [
 round_robin: true
 
 n_db_nodes: 3
-n_loaders: 4
+n_loaders: 2
 
 instance_type_db: 'i4i.4xlarge'
 instance_type_loader: 'c7i.8xlarge'
