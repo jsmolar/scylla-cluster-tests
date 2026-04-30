@@ -1,0 +1,89 @@
+test_duration: 720
+
+n_db_nodes: 6
+n_loaders: 2
+seeds_num: 3
+simulated_racks: 3
+
+round_robin: true
+
+instance_type_db: 'i8g.2xlarge'
+append_scylla_setup_args: ' --no-ec2-check '
+
+nemesis_class_name: 'NoOpMonkey'
+nemesis_selector: "not AddDropColumnMonkey and not ToggleTableIcsMonkey and not ToggleGcModeMonkey
+  and not ToggleCDCMonkey and not NoCorruptRepairMonkey
+  and not EnableDisableTableEncryptionAwsKmsProviderWithRotationMonkey
+  and not EnableDisableTableEncryptionAwsKmsProviderWithoutRotationMonkey
+  and not ToggleAuditNemesisSyslog and not AddRemoveMvNemesis
+  and not ModifyTableCommentMonkey and not ModifyTableGcGraceTimeMonkey
+  and not ModifyTableCachingMonkey and not ModifyTableBloomFilterFpChanceMonkey
+  and not ModifyTableCompactionMonkey and not ModifyTableCompressionMonkey
+  and not ModifyTableCrcCheckChanceMonkey and not ModifyTableDclocalReadRepairChanceMonkey
+  and not ModifyTableDefaultTimeToLiveMonkey and not ModifyTableMaxIndexIntervalMonkey
+  and not ModifyTableMinIndexIntervalMonkey and not ModifyTableMemtableFlushPeriodInMsMonkey
+  and not ModifyTableReadRepairChanceMonkey and not ModifyTableSpeculativeRetryMonkey
+  and not ModifyTableTwcsWindowSizeMonkey
+  and not DecommissionMonkey and not DecommissionSeedNode and not AbortDecommissionMonkey
+  and not TerminateAndRemoveNodeMonkey and not NodeTerminateAndReplace
+  and not DecommissionStreamingErrMonkey and not GrowShrinkClusterNemesis
+  and not AddRemoveRackNemesis and not AddRemoveDcNemesis and not BootstrapStreamingErrorNemesis
+  and not GrowShrinkZeroTokenNode and not DrainKubernetesNodeThenReplaceScyllaNode
+  and not TerminateKubernetesHostThenReplaceScyllaNode
+  and not DrainKubernetesNodeThenDecommissionAndAddScyllaNode
+  and not TerminateKubernetesHostThenDecommissionAndAddScyllaNode
+  and not OperatorNodeReplace and not IsolateNodeWithProcessSignalNemesis
+  and not IsolateNodeWithIptableRuleNemesis
+  and not TruncateMonkey and not TruncateLargeParititionMonkey
+  and not KillMVBuildingCoordinator and not CreateIndexNemesis and not CDCStressorMonkey
+  and not MgmtBackupSpecificKeyspaces" # No bckup needed here
+
+user_prefix: 'longevity-50pct-util-12h'
+space_node_threshold: 960000
+
+server_encrypt: true
+client_encrypt: true
+
+pre_create_schema: True
+sstable_size: 100
+
+hinted_handoff: 'enabled'
+parallel_node_operations: true
+
+nemesis_during_prepare: false
+
+prepare_write_cmd:
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM n=130000000
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..130000000
+    -col 'n=FIXED(10) size=FIXED(512)'
+    -log interval=5
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM n=130000000
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=130000001..260000000
+    -col 'n=FIXED(10) size=FIXED(512)'
+    -log interval=5
+
+stress_cmd:
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM duration=480m
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..260000000
+    -col 'n=FIXED(10) size=FIXED(512)'
+    -log interval=5
+  - >-
+    cql-stress-cassandra-stress read  cl=QUORUM duration=480m
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=SizeTieredCompactionStrategy)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..260000000
+    -col 'n=FIXED(10) size=FIXED(512)'
+    -log interval=5

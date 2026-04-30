@@ -14,12 +14,14 @@
 # Copyright (c) 2026 ScyllaDB
 
 import re
+import time
 from enum import Enum
 
 from longevity_test import LongevityTest
+from sdcm.cluster import DB_LOG_PATTERN_RESHARDING_FINISH, DB_LOG_PATTERN_RESHARDING_START
 from sdcm.sct_events.system import InfoEvent
 from sdcm.utils.tablets.common import wait_no_tablets_migration_running
-from sdcm.wait import wait_for
+from sdcm.wait import wait_for, wait_for_log_lines
 
 
 class NodeMigrationStatus(str, Enum):
@@ -28,10 +30,18 @@ class NodeMigrationStatus(str, Enum):
     USES_TABLETS = "uses tablets"
 
 
-def get_nodetool_migrate_to_tablets_status(node, keyspace: str) -> NodeMigrationStatus:
+class MigrationStatusMap(dict):
+    """Maps host_id -> NodeMigrationStatus, indexable by node object or host_id string."""
+
+    def __getitem__(self, key):
+        host_id = getattr(key, "host_id", key)
+        return super().__getitem__(host_id)
+
+
+def get_nodetool_migrate_to_tablets_status(node, keyspace: str) -> MigrationStatusMap:
     """
     Run 'nodetool migrate-to-tablets status <keyspace>' on the given node and return
-    that node's migration status.
+    migration status for all nodes in the cluster.
 
     Example output:
         Nodes:
@@ -39,22 +49,60 @@ def get_nodetool_migrate_to_tablets_status(node, keyspace: str) -> NodeMigration
         dc1c5a03-8878-49da-a6f3-bd27d6a2d85d uses vnodes
         b1428349-2154-41c9-a5c1-dd33c71bd571 migrating to tablets
 
-    Returns: NodeMigrationStatus for node.host_id.
-    Raises: ValueError if node.host_id is not found in the output.
+    Returns: MigrationStatusMap of host_id -> NodeMigrationStatus, indexable by node object too.
     """
     res = node.run_nodetool(f"migrate-to-tablets status {keyspace}")
     pattern = re.compile(r"(?P<host_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+(?P<status>.+)")
+    statuses = MigrationStatusMap()
     for line in res.stdout.splitlines():
         match = pattern.match(line.strip())
-        if match and match.group("host_id") == node.host_id:
-            return NodeMigrationStatus(match.group("status").strip())
-    raise ValueError(
-        f"host_id {node.host_id!r} not found in 'nodetool migrate-to-tablets status {keyspace}' output:\n{res.stdout}"
-    )
+        if match:
+            statuses[match.group("host_id")] = NodeMigrationStatus(match.group("status").strip())
+    return statuses
 
 
 class VnodeToTabletMigrationTest(LongevityTest):
     """Test vnode to tablet migration scenarios."""
+
+    def restart_node_after_migration(self, node) -> None:
+        """Restart a node after migrate-to-tablets upgrade, waiting for resharding to complete.
+
+        After the upgrade the node reshards all data on startup. For large datasets
+        (hundreds of GB) this can take 15+ minutes. This method monitors the scylla
+        log for resharding start/finish and logs the elapsed duration so slow reshards
+        are visible in test output.
+
+        Args:
+            node: The DB node to restart.
+        """
+        reshard_timeout = 3600
+        self.log.info(
+            "Restarting node %s after migrate-to-tablets upgrade (reshard_timeout=%ds)", node.name, reshard_timeout
+        )
+        node.run_nodetool("drain")
+        node.stop_scylla(verify_down=True)
+
+        reshard_start = time.time()
+        with wait_for_log_lines(
+            node=node,
+            start_line_patterns=[DB_LOG_PATTERN_RESHARDING_START],
+            end_line_patterns=[DB_LOG_PATTERN_RESHARDING_FINISH],
+            start_timeout=600,
+            end_timeout=reshard_timeout,
+            error_msg_ctx=f"Resharding on {node.name} after tablet migration",
+        ):
+            node.start_scylla(verify_up=False, timeout=reshard_timeout * 2)
+        reshard_duration = time.time() - reshard_start
+        self.log.info(
+            "Resharding on %s completed in %.1f seconds (%.1f minutes)",
+            node.name,
+            reshard_duration,
+            reshard_duration / 60,
+        )
+
+        node.wait_db_up(timeout=reshard_timeout)
+        self.db_cluster.wait_for_nodes_up_and_normal(nodes=[node], timeout=reshard_timeout)
+        node.wait_node_fully_start(timeout=reshard_timeout)
 
     def test_vnode_to_tablet_migration(self):
         """
@@ -103,35 +151,36 @@ class VnodeToTabletMigrationTest(LongevityTest):
         InfoEvent(message=f"Step 3 - Starting tablet migration for keyspaces: {keyspaces}").publish()
         for ks in keyspaces:
             coordinator_node.run_nodetool(f"migrate-to-tablets start {ks}")
+            nodes_status = get_nodetool_migrate_to_tablets_status(coordinator_node, ks)
             for node in self.db_cluster.data_nodes:
-                status = get_nodetool_migrate_to_tablets_status(node, ks)
-                assert status == NodeMigrationStatus.USES_VNODES, (
-                    f"[ks={ks}] Expected {NodeMigrationStatus.USES_VNODES!r} for {node.host_id}, got {status!r}"
+                assert nodes_status[node] == NodeMigrationStatus.USES_VNODES, (
+                    f"[ks={ks}] Expected {NodeMigrationStatus.USES_VNODES!r} for {node.host_id}, got {nodes_status[node]!r}"
                 )
 
         InfoEvent(message="Step 4 - Rolling restart with migrate-to-tablets upgrade").publish()
         for node in self.db_cluster.data_nodes:
-            node.running_nemesis = "vnode_to_tablet_migration"
-            self.log.info("Preparing node %s (ip=%s) for tablet migration", node.name, node.ip_address)
-            node.run_nodetool("migrate-to-tablets upgrade")
-            self.log.info("Verify that the node status changed from vnodes to migrating to tablets")
-            for ks in keyspaces:
-                status = get_nodetool_migrate_to_tablets_status(node, ks)
-                assert status == NodeMigrationStatus.MIGRATING, (
-                    f"[ks={ks}] Expected {NodeMigrationStatus.MIGRATING!r} for {node.host_id}, got {status!r}"
-                )
-            node.run_nodetool("drain")
-            self.log.info("Restarting node %s after prepare-node", node.name)
-            node.stop_scylla(verify_down=True)
-            node.start_scylla(verify_up=True)
-            self.db_cluster.wait_for_nodes_up_and_normal(nodes=[node])
-            node.wait_node_fully_start()
-            self.log.info("Node %s is back up and normal after restart", node.name)
-            node.running_nemesis = None
+            wait_for(
+                func=lambda n=node: not n.running_nemesis,
+                step=30,
+                timeout=600,
+                text=f"Waiting for nemesis on {node.name} to finish before upgrade",
+            )
+            with self.nemesis_allocator.nodes_running_nemesis(node, "vnode_to_tablet_migration"):
+                self.log.info("Preparing node %s (ip=%s) for tablet migration", node.name, node.ip_address)
+                node.run_nodetool("migrate-to-tablets upgrade")
+                self.log.info("Verify that the node status changed from vnodes to migrating to tablets")
+                for ks in keyspaces:
+                    nodes_status = get_nodetool_migrate_to_tablets_status(node, ks)
+                    assert nodes_status[node] == NodeMigrationStatus.MIGRATING, (
+                        f"[ks={ks}] Expected {NodeMigrationStatus.MIGRATING!r} for {node.host_id}, got {nodes_status[node]!r}"
+                    )
+                self.restart_node_after_migration(node)
+                self.log.info("Node %s is back up and normal after restart", node.name)
+
             self.log.info("Waiting for node %s status to change to 'uses tablets'", node.name)
             for ks in keyspaces:
                 wait_for(
-                    func=lambda n=node, k=ks: get_nodetool_migrate_to_tablets_status(n, k)
+                    func=lambda n=node, k=ks: get_nodetool_migrate_to_tablets_status(n, k)[n]
                     == NodeMigrationStatus.USES_TABLETS,
                     step=60,
                     timeout=3600,

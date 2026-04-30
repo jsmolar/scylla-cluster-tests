@@ -46,8 +46,11 @@ def check_nodes_status(nodes_status: dict, current_node, removed_nodes_list=()) 
         if node_properties["status"] != "UN":
             LOGGER.debug("All nodes that have been removed up until this point: %s", str(removed_nodes_list))
             is_target = current_node.print_node_running_nemesis(node.ip_address)
+            # Downgrade to WARNING when the DN node is a known nemesis target — it is
+            # expected to be temporarily unavailable while the nemesis is running.
+            severity = Severity.WARNING if node.running_nemesis else Severity.CRITICAL
             yield ClusterHealthValidatorEvent.NodeStatus(
-                severity=Severity.CRITICAL,
+                severity=severity,
                 node=current_node.name,
                 error=f"Current node {current_node}. Node {node}{is_target} status is {node_properties['status']}",
             )
