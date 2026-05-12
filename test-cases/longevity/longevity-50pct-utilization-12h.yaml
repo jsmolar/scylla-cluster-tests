@@ -52,7 +52,7 @@ nemesis_during_prepare: false
 prepare_write_cmd:
   - >-
     cql-stress-cassandra-stress write cl=QUORUM n=120000000
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=TimeWindowCompactionStrategy)'
     -mode cql3 native
     -rate threads=80
     -pop seq=1..120000000
@@ -60,7 +60,7 @@ prepare_write_cmd:
     -log interval=5
   - >-
     cql-stress-cassandra-stress write cl=QUORUM n=120000000
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=TimeWindowCompactionStrategy)'
     -mode cql3 native
     -rate threads=80
     -pop seq=120000001..240000000
@@ -70,7 +70,7 @@ prepare_write_cmd:
 stress_cmd:
   - >-
     cassandra-stress mixed cl=QUORUM duration=480m
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=TimeWindowCompactionStrategy)'
     -mode cql3 native
     -rate threads=80
     -pop seq=1..120000000
@@ -78,7 +78,7 @@ stress_cmd:
     -log interval=5
   - >-
     cassandra-stress mixed  cl=QUORUM duration=480m
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=TimeWindowCompactionStrategy)'
     -mode cql3 native
     -rate threads=80
     -pop seq=120000001..240000000
