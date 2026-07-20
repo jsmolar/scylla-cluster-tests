@@ -20,7 +20,8 @@ from enum import StrEnum
 from longevity_test import LongevityTest
 from sdcm.cluster import DB_LOG_PATTERN_RESHARDING_FINISH, DB_LOG_PATTERN_RESHARDING_START
 from sdcm.sct_events.system import InfoEvent
-from sdcm.utils.decorators import latency_calculator_decorator
+from sdcm.utils.decorators import latency_calculator_decorator, optional_stage
+
 from sdcm.utils.tablets.common import wait_no_tablets_migration_running
 from sdcm.wait import wait_for, wait_for_log_lines
 
@@ -96,6 +97,36 @@ def get_pow2_convergence_status(node, keyspace: str) -> dict[str, TableConvergen
 
 class VnodeToTabletMigrationTest(LongevityTest):
     """Test vnode to tablet migration scenarios."""
+
+    def create_tables_for_scylla_bench(self, window_size=60, ttl=10800):
+        """Create the scylla_bench keyspace and a TWCS table for timeseries workloads.
+
+        Args:
+            window_size: TWCS compaction_window_size in minutes (default 60).
+            ttl: default_time_to_live in seconds (default 10800 = 3 hours).
+        """
+        with self.db_cluster.cql_connection_patient(self.db_cluster.nodes[0]) as session:
+            session.execute("""
+                CREATE KEYSPACE scylla_bench WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'}
+                AND durable_writes = true;""")
+            session.execute(f"""
+                CREATE TABLE scylla_bench.test (
+                    pk bigint,
+                    ck bigint,
+                    v  blob,
+                    PRIMARY KEY (pk, ck)
+                ) WITH CLUSTERING ORDER BY (ck ASC)
+                    AND default_time_to_live = {ttl}
+                    AND compaction = {{'class': 'TimeWindowCompactionStrategy', 'compaction_window_size': '{window_size}',
+                    'compaction_window_unit': 'MINUTES'}}
+                    AND tombstone_gc = {{'mode':'immediate'}}
+                    AND compression = {{'sstable_compression': 'ZstdWithDictsCompressor'}}""")
+
+    @optional_stage("prepare_write")
+    def run_pre_create_schema(self):
+        pre_create_schema = self.params.get("pre_create_schema")
+        if pre_create_schema:
+            self.create_tables_for_scylla_bench()
 
     def restart_node_after_migration(self, node) -> None:
         """Restart a node after migrate-to-tablets upgrade, waiting for resharding to complete.
@@ -245,10 +276,15 @@ class VnodeToTabletMigrationTest(LongevityTest):
 
         The latency_calculator_decorator collects HDR histogram data for this time window
         and reports P90/P99 latencies and throughput to Argus.
+
+        The ``duration`` kwarg is intentionally omitted so the subprocess timeout is
+        derived from the stress command itself (e.g. scylla-bench ``-duration=120m``
+        via ``get_timeout_from_stress_cmd``).  Passing an explicit ``duration=30``
+        would cap the timeout at 2400 s — shorter than a 120-minute bench run.
         """
         stress_queue = []
         for cmd in self.params.get("stress_cmd"):
-            stress_queue.append(self.run_stress_thread(stress_cmd=cmd, duration=30))
+            stress_queue.append(self.run_stress_thread(stress_cmd=cmd))
         for stress in stress_queue:
             self.verify_stress_thread(stress)
         return stress_queue
@@ -283,10 +319,12 @@ class VnodeToTabletMigrationTest(LongevityTest):
 
         The latency_calculator_decorator collects HDR histogram data for this time window
         and reports P90/P99 latencies and throughput to Argus.
+
+        The ``duration`` kwarg is intentionally omitted — see ``run_pre_migration_benchmark``.
         """
         stress_queue = []
         for cmd in self.params.get("stress_cmd"):
-            stress_queue.append(self.run_stress_thread(stress_cmd=cmd, duration=30))
+            stress_queue.append(self.run_stress_thread(stress_cmd=cmd))
         for stress in stress_queue:
             self.verify_stress_thread(stress)
         return stress_queue

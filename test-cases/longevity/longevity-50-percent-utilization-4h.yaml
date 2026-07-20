@@ -1,81 +1,56 @@
+# LONGEVITY TEST: VNODE-TO-TABLET MIGRATION WITH TWCS
+#
+# Purpose:
+#   Validates ScyllaDB stability during vnode-to-tablet migration under a sustained
+#   time-series workload using Time-Window Compaction Strategy (TWCS) with 60-minute
+#   compaction windows, a 3-hour TTL, and ZSTD dictionary compression.
+#
 # Cluster:
-#   6 DB nodes (i8g.xlarge, ARM64), 3 simulated racks, 2 loaders
-#   RF=3, ICS compaction, server + client TLS
+#   6 DB nodes (i8g.xlarge — ARM64/Graviton) + 2 loaders
+#   Replication factor: 3
+#   Nemesis: SisyphusMonkey every 15 min (ModifyTableCompactionMonkey excluded to
+#            preserve TWCS settings)
 #
-# Dataset:
-#   ~50% disk utilization on i8g.xlarge
-#   2x write streams, 120M rows each (seq 1..120M and 120M+1..240M)
-#   512B x 5 columns
+# Workload:
+#   - Preload write: 90K ops/s max rate, 150 concurrency, 200K partitions × 100K rows × 2000B
+#   - Benchmark/migration load: 31.5K ops/s background write + read (half-normal)
 #
-# Stress (stress_cmd, 240m mixed):
-#   Reused across all three migration phases:
-#     - Pre-migration benchmark: run for 60m by vnode_to_tablet_migration_test
-#     - Migration:               run for full 240m concurrently with migration
-#     - Post-migration benchmark: run for 60m by vnode_to_tablet_migration_test
+# Schema (created by VnodeToTabletMigrationTWCS.create_tables_for_scylla_bench):
+#   - default_time_to_live: 10800 (3 hours)
+#   - TWCS: compaction_window_size=60 MINUTES
+#   - tombstone_gc: immediate
+#   - compression: ZstdWithDictsCompressor
+
+prepare_write_cmd: [
+    "scylla-bench -workload=timeseries -mode=write -replication-factor=3 -partition-count=200000 -clustering-row-count=100000 -clustering-row-size=uniform:1024..4096 -concurrency=150 -rows-per-request=1 -start-timestamp=SET_WRITE_TIMESTAMP -connection-count 100 -max-rate 90000 -timeout=120s -retry-number=30 -retry-interval=80ms,1s -duration=120m"
+]
+
+stress_cmd: [
+    "scylla-bench -workload=timeseries -mode=write -replication-factor=3 -partition-count=200000 -concurrency=150 -clustering-row-count=100000 -clustering-row-size=uniform:1024..4096 -rows-per-request=1 -start-timestamp=SET_WRITE_TIMESTAMP -connection-count 100 -max-rate 31500 -timeout=120s -retry-number=30 -retry-interval=80ms,1s -duration=200m",
+    "scylla-bench -workload=timeseries -mode=read -replication-factor=3 -partition-count=200000 -concurrency=150  -clustering-row-count=100000 -clustering-row-size=uniform:1024..4096 -rows-per-request=1 -start-timestamp=GET_WRITE_TIMESTAMP -write-rate 210 -distribution hnormal --connection-count 100 -timeout=30s -retry-number=30 -retry-interval=80ms,1s -duration=200m",
+]
 
 test_duration: 600
 
 n_db_nodes: 6
 n_loaders: 2
-seeds_num: 3
-simulated_racks: 3
+
+sizing_db:
+  vcpu: 4
+  memory: '>=32'
+  local_disk_gb: '>=900'
 
 round_robin: true
 
-instance_type_db: 'i8g.xlarge'
-append_scylla_setup_args: ' --no-ec2-check '
-
-nemesis_class_name: 'SisyphusMonkey'
+nemesis_class_name: 'NoOpMonkey'
+# Exclude ModifyTableCompactionMonkey to avoid overriding TWCS settings
+nemesis_selector: 'not ModifyTableCompactionMonkey'
+nemesis_seed: '025'
 nemesis_interval: 15
+nemesis_during_prepare: false
 
 user_prefix: 'longevity-50-percent-utilization-4h'
 space_node_threshold: 64424
 
 pre_create_schema: true
-sstable_size: 100
-
-server_encrypt: true
-client_encrypt: true
-
-hinted_handoff: 'enabled'
-parallel_node_operations: true
-
-nemesis_during_prepare: false
-
-prepare_write_cmd:
-  - >-
-    cassandra-stress write cl=QUORUM n=120000000
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
-    -mode cql3 native
-    -rate threads=80
-    -pop seq=1..120000000
-    -col 'n=FIXED(5) size=FIXED(512)'
-    -log interval=5
-  - >-
-    cassandra-stress write cl=QUORUM n=120000000
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
-    -mode cql3 native
-    -rate threads=80
-    -pop seq=120000001..240000000
-    -col 'n=FIXED(5) size=FIXED(512)'
-    -log interval=5
-
-stress_cmd:
-  - >-
-    cassandra-stress mixed cl=QUORUM duration=240m
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
-    -mode cql3 native
-    -rate threads=50 throttle=30000/s
-    -pop seq=1..120000000
-    -col 'n=FIXED(5) size=FIXED(512)'
-    -log interval=5
-  - >-
-    cassandra-stress mixed cl=QUORUM duration=240m
-    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3) compaction(strategy=IncrementalCompactionStrategy)'
-    -mode cql3 native
-    -rate threads=50 throttle=30000/s
-    -pop seq=120000001..240000000
-    -col 'n=FIXED(5) size=FIXED(512)'
-    -log interval=5
-
 use_hdrhistogram: true
