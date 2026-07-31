@@ -52,7 +52,7 @@ const PARTITION_SIZES = latte::param!("partition_sizes", "100:1");
 
 const NUM_PKS = latte::param!("num_pks", 10);
 const RANGE_LIMIT = latte::param!("range_limit", 2000000);
-const SCAN_TIMEOUT = latte::param!("scan_timeout", "600s");
+const SCAN_TIMEOUT = latte::param!("scan_timeout", "3600s");
 
 const P_WRITE = "latte_prep_stmt__write";
 const P_RANGE_READ = "latte_prep_stmt__range_read";
