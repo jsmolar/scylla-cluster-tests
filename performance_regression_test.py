@@ -15,6 +15,7 @@
 
 
 import os
+import re
 import time
 from typing import Optional
 
@@ -691,6 +692,58 @@ class PerformanceRegressionTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         self.wait_no_compactions_running(n=160)
         self.run_fstrim_on_all_db_nodes()
         self.run_workload(stress_cmd=self.params.get("stress_cmd_m"), nemesis=True, sub_type="mixed")
+
+    def test_sequential_latency(self):
+        """Run every stress_cmd entry sequentially, treating each as an independent performance cycle.
+
+        Each command is wrapped in latency_calculator_decorator so per-cycle latency data (HDR
+        histograms, Grafana screenshots, reactor-stall stats) is collected and sent to Argus
+        before the next command is started.
+
+        Designed for workloads like the S3 range-query latte benchmark where the intent is to
+        measure each query type in isolation one after another.
+
+        Test steps:
+        1. Preload data via prepare_write_cmd (e.g. latte insert).
+        2. Wait for compactions to finish, run fstrim.
+        3. Collect a no-load steady-state baseline.
+        4. Run each stress_cmd sequentially; report latency results to Argus per cycle.
+        """
+        self.run_fstrim_on_all_db_nodes()
+        self.preload_data()
+        self.wait_no_compactions_running()
+        self.run_fstrim_on_all_db_nodes()
+
+        stress_cmds = self.params.get("stress_cmd")
+        if isinstance(stress_cmds, str):
+            stress_cmds = [stress_cmds]
+
+        # Derive HDR tags from the first stress command for the steady-state baseline.
+        # latte uses 'fn--<function_name>' as HDR tag; extract from '--function=<name>'.
+        def _get_hdr_tags_from_cmd(cmd: str) -> list[str]:
+            match = re.search(r"--function[= ](\S+)", cmd)
+            if match:
+                return [f"fn--{match.group(1)}"]
+            return []
+
+        baseline_hdr_tags = _get_hdr_tags_from_cmd(stress_cmds[0]) if stress_cmds else []
+        self.steady_state_latency(hdr_tags=baseline_hdr_tags)
+
+        for stress_cmd in stress_cmds:
+            match = re.search(r"--function[= ](\S+)", stress_cmd)
+            cycle_name = match.group(1) if match else "stress_cmd"
+
+            @latency_calculator_decorator(workload_type="read", cycle_name=cycle_name, legend=cycle_name)
+            def _run_single_cmd(tester, cmd):
+                stress_thread = tester.run_stress_thread(
+                    stress_cmd=cmd, stress_num=1, round_robin=True, stats_aggregate_cmds=False
+                )
+                tester.verify_stress_thread(stress_thread)
+                tester.get_stress_results(queue=stress_thread, store_results=True)
+                # NOTE: 'hdr_tags' will be used by the 'latency_calculator_decorator' decorator
+                return {"hdr_tags": stress_thread.hdr_tags}
+
+            _run_single_cmd(self, stress_cmd)
 
     # MV Tests
     def test_mv_write(self):
