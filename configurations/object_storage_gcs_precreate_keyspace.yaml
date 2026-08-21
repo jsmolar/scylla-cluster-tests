@@ -1,0 +1,3 @@
+# 'endpoint' must match the 'name' of the GCS endpoint in object_storage_gcs.yaml verbatim
+# (scheme included): unlike S3, Scylla does not parse the URL for 'gs' endpoints.
+pre_create_keyspace: "CREATE KEYSPACE IF NOT EXISTS keyspace1 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND storage = {'type': 'GS', 'bucket': 'manager-backup-tests-sct-project-1-us-east1', 'endpoint': 'https://storage.googleapis.com'};"
