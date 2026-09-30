@@ -292,8 +292,6 @@ def test_18_error_if_no_version_repo_ami_selected(monkeypatch):
             continue
         if "siren" in backend:
             continue
-        if backend == "baremetal":
-            continue
         if backend == "xcloud":
             monkeypatch.setenv("SCT_XCLOUD_PROVIDER", "aws")
         monkeypatch.setenv("SCT_CLUSTER_BACKEND", backend)
@@ -423,10 +421,10 @@ def test_xcloud_replication_factor_valid(monkeypatch):
     monkeypatch.setenv("SCT_XCLOUD_ENV", "fake-env")
 
     with (
-        patch("sdcm.sct_config.ScyllaCloudAPIClient", return_value=_make_xcloud_api_mock()),
-        patch("sdcm.sct_config.KeyStore"),
-        patch("sdcm.sct_config.convert_name_to_ami_if_needed", side_effect=lambda v, _: v),
-        patch("sdcm.sct_config.find_scylla_repo", return_value="https://fake-repo/scylla.repo"),
+        patch("sdcm.sct_config.config.ScyllaCloudAPIClient", return_value=_make_xcloud_api_mock()),
+        patch("sdcm.sct_config.config.KeyStore"),
+        patch("sdcm.sct_config.config.convert_name_to_ami_if_needed", side_effect=lambda v, _: v),
+        patch("sdcm.sct_config.config.find_scylla_repo", return_value="https://fake-repo/scylla.repo"),
     ):
         conf = sct_config.SCTConfiguration()
         # Must not raise TypeError or ValueError
@@ -451,10 +449,10 @@ def test_xcloud_replication_factor_exceeds_min_dc(monkeypatch):
     monkeypatch.setenv("SCT_XCLOUD_ENV", "fake-env")
 
     with (
-        patch("sdcm.sct_config.ScyllaCloudAPIClient", return_value=_make_xcloud_api_mock()),
-        patch("sdcm.sct_config.KeyStore"),
-        patch("sdcm.sct_config.convert_name_to_ami_if_needed", side_effect=lambda v, _: v),
-        patch("sdcm.sct_config.find_scylla_repo", return_value="https://fake-repo/scylla.repo"),
+        patch("sdcm.sct_config.config.ScyllaCloudAPIClient", return_value=_make_xcloud_api_mock()),
+        patch("sdcm.sct_config.config.KeyStore"),
+        patch("sdcm.sct_config.config.convert_name_to_ami_if_needed", side_effect=lambda v, _: v),
+        patch("sdcm.sct_config.config.find_scylla_repo", return_value="https://fake-repo/scylla.repo"),
     ):
         conf = sct_config.SCTConfiguration()
         with pytest.raises(ValueError, match="xcloud_replication_factor .* cannot be greater than n_db_nodes"):

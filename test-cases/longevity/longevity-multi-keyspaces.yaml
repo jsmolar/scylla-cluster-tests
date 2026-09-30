@@ -1,4 +1,31 @@
 # Test
+#
+# NOTE: 'longevity-multi-keyspaces-latte.yaml' replaced this test for the tier2,
+#       vnodes, raft, and gce pipelines. Keep this cassandra-stress version for
+#       on-demand runs, such as reproducing older results or comparing stress
+#       tools. No pipeline uses it, so run it explicitly with:
+#
+#           longevity_test.LongevityTest.test_batch_custom_time
+
+test_metadata:
+  description: >-
+    60-hour schema-scale longevity test: 1000 keyspaces pre-created on a 6-node cluster, each driven
+    in batch mode by cassandra-stress from 10 loaders, with random-keyspace fullscans and
+    SisyphusMonkey. Exercises how metadata, schema propagation and per-table overhead behave at high
+    keyspace counts.
+  test_type: longevity
+  tier: ondemand
+  duration_class: long
+  supported_backends:
+    - aws
+    - gce
+  stress_tools:
+    - cassandra-stress
+  workload: mixed
+  nemesis_labels:
+    - SisyphusMonkey
+  team_ownership: core-test-infra
+
 test_duration: 3600
 prepare_write_cmd: ["cassandra-stress write no-warmup cl=QUORUM n=4000000 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate threads=20 -pop seq=1..4000000 -log interval=30"]
 stress_cmd: ["cassandra-stress mixed cl=QUORUM duration=48h -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate threads=10 -pop seq=1..4000000 -log interval=90"]
@@ -19,12 +46,16 @@ nemesis_interval: 30
 n_db_nodes: 6
 n_loaders: 10
 
-instance_type_db: 'i4i.8xlarge'
-gce_instance_type_db: 'n2-highmem-64'
-gce_n_local_ssd_disk_db: 16
+sizing_db:
+  vcpu: 32
+  # OCI DenseIO.E5 at 32 vCPUs provides only 192 GB (12 GB/OCPU fixed ratio).
+  # Lowered from >=256 to >=192 so OCI can match; other clouds still pick >=256 naturally.
+  memory: '>=192'
 
 root_disk_size_db: 60 # twice as as default, cause each keyspace generate lots of logs
-instance_type_loader: 'c6i.4xlarge'
+sizing_loader:
+  vcpu: 16
+  memory: '>=32'
 root_disk_size_monitor: 100
 root_disk_size_runner: 120
 

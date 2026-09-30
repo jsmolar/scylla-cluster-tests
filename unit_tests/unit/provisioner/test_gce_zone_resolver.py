@@ -56,7 +56,7 @@ def test_required_machine_types_collects_all_role_types_when_active():
         gce_instance_type_db="n2-highmem-8",
         gce_instance_type_loader="e2-standard-2",
         gce_instance_type_monitor="n2-highmem-4",
-        instance_type_db_oracle="n2-highmem-16",
+        gce_instance_type_db_oracle="n2-highmem-16",
         instance_type_db_target="n2d-standard-8",
         nemesis_grow_shrink_instance_type="n2-highmem-16",
         zero_token_instance_type_db="e2-medium",
@@ -86,7 +86,7 @@ def test_required_machine_types_excludes_types_with_zero_node_count():
         gce_instance_type_loader="e2-standard-2",
         gce_instance_type_monitor="n2-highmem-8",
         instance_type_vector_store="e2-medium",
-        instance_type_db_oracle="n2-highmem-16",
+        gce_instance_type_db_oracle="n2-highmem-16",
         zero_token_instance_type_db="e2-medium",
         n_loaders=0,
         n_monitor_nodes=0,
@@ -172,6 +172,40 @@ def test_resolve_multi_region_multi_az_drops_unsupported_and_fills(mock_multi_re
     GceAZResolver(params).resolve()
     result = params["availability_zone"].split(",")
     assert set(result) == {"b", "c", "d"}
+
+
+def test_resolve_raises_when_regions_cannot_supply_the_configured_zone_count(mock_multi_region):
+    """'b,c,d' asks for three racks; two zones would silently build a two-rack cluster."""
+    mock_multi_region["us-east1"] = ["us-east1-b", "us-east1-c", "us-east1-d"]
+    mock_multi_region["us-west1"] = ["us-west1-b", "us-west1-c"]
+    params = _make_params(gce_datacenter="us-east1 us-west1", availability_zone="b,c,d")
+
+    with pytest.raises(NoValidAvailabilityZoneError, match="requests 3 zone.*only 2"):
+        GceAZResolver(params).resolve()
+
+    # the caller must see the value it configured, not a silently narrowed one
+    assert params["availability_zone"] == "b,c,d"
+
+
+def test_resolve_raises_when_a_single_region_cannot_supply_the_configured_zone_count(mock_gce_zone_resolver):
+    """The shortfall is about the count, not about how many regions are configured."""
+    _, resolver_instance = mock_gce_zone_resolver
+    resolver_instance.get_common_zones.return_value = ["us-east1-b", "us-east1-c"]
+    params = _make_params(availability_zone="b,c,d")
+
+    with pytest.raises(NoValidAvailabilityZoneError, match="requests 3 zone.*only 2"):
+        GceAZResolver(params).resolve()
+
+
+def test_resolve_does_not_raise_when_the_zone_count_is_preserved(mock_gce_zone_resolver):
+    """Substituting an unsupported zone is fine - only a shortfall in the count is fatal."""
+    _, resolver_instance = mock_gce_zone_resolver
+    resolver_instance.get_common_zones.return_value = ["us-east1-c", "us-east1-d"]
+    params = _make_params(availability_zone="b,c")
+
+    GceAZResolver(params).resolve()
+
+    assert sorted(params["availability_zone"].split(",")) == ["c", "d"]
 
 
 @pytest.fixture(name="mock_discovery_resolver")

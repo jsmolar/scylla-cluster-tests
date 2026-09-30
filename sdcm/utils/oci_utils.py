@@ -26,7 +26,7 @@ import time
 
 import oci
 from oci.core import BlockstorageClient, ComputeClient, VirtualNetworkClient
-from oci.core.models import Image, Instance
+from oci.core.models import Image, Instance, InstanceSourceViaImageDetails
 from oci.exceptions import ServiceError
 from oci.identity import IdentityClient
 from oci.object_storage import ObjectStorageClient
@@ -37,6 +37,9 @@ from sdcm.provision.provisioner import VmArch
 from sdcm.utils.metaclasses import Singleton
 
 LOGGER = logging.getLogger(__name__)
+
+# OCI refuses to create a boot volume smaller than this.
+MIN_BOOT_VOLUME_SIZE_IN_GBS = 50
 
 OCI_RETRY_STRATEGY = oci.retry.RetryStrategyBuilder(
     max_attempts_check=True,
@@ -70,6 +73,15 @@ def vmarch_to_oci(arch: VmArch) -> str:
         return "aarch64"
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
+
+
+_OCI_ARM_SHAPE_RE = re.compile(r"\.Standard\.A\d+\.", re.IGNORECASE)
+
+
+def get_arch_from_oci_shape(shape: str | None) -> VmArch:
+    if shape and _OCI_ARM_SHAPE_RE.search(shape):
+        return VmArch.ARM
+    return VmArch.X86
 
 
 # Supported OCI regions for SCT
@@ -217,6 +229,7 @@ def get_platform_image_ocid(
     operating_system: str = "Oracle Linux",
     version: str = "8",
     shape: str | None = None,
+    arch: VmArch = VmArch.X86,
 ) -> str:
     """Get the latest platform image OCID for the specified OS and version.
 
@@ -252,20 +265,23 @@ def get_platform_image_ocid(
         **kwargs,
     )
 
-    amd64_images = []
+    want_arm = arch is VmArch.ARM
+    matching_images = []
     while current_image := next(images, None):
         current_image_name = current_image.display_name.lower()
-        # Filter for amd64/x86_64 images (exclude ARM)
-        if "aarch64" not in current_image_name and "arm" not in current_image_name:
-            amd64_images.append(current_image)
-    if not amd64_images:
+        is_arm_image = "aarch64" in current_image_name or "arm" in current_image_name
+        if is_arm_image == want_arm:
+            matching_images.append(current_image)
+    if not matching_images:
         shape_msg = f" compatible with shape {shape}" if shape else ""
-        raise ValueError(f"No {operating_system} {version} amd64 image{shape_msg} found in region {region}")
+        raise ValueError(
+            f"No {operating_system} {version} {vmarch_to_oci(arch)} image{shape_msg} found in region {region}"
+        )
 
-    latest_image = amd64_images[0]
+    latest_image = matching_images[0]
     LOGGER.info(
         "Found %d images. Pick latest %s %s image: %s (OCID: %s)",
-        len(amd64_images),
+        len(matching_images),
         operating_system,
         version,
         latest_image.display_name,
@@ -274,13 +290,19 @@ def get_platform_image_ocid(
     return latest_image.id
 
 
-def get_ubuntu_image_ocid(compartment_id: str, region: str | None = None, version: str = "24.04") -> str:
+def get_ubuntu_image_ocid(
+    compartment_id: str,
+    region: str | None = None,
+    version: str = "24.04",
+    arch: VmArch = VmArch.X86,
+) -> str:
     """Get the latest Ubuntu image OCID for the specified region.
 
     Args:
         compartment_id: The compartment OCID (used for API call context)
         region: OCI region name
         version: Ubuntu version (default: "24.04")
+        arch: VM architecture to filter by
 
     Returns:
         OCID of the latest Ubuntu image
@@ -293,6 +315,7 @@ def get_ubuntu_image_ocid(compartment_id: str, region: str | None = None, versio
         region=region,
         operating_system="Canonical Ubuntu",
         version=version,
+        arch=arch,
     )
 
 
@@ -901,7 +924,7 @@ def import_image_from_object_storage(
 
 
 def is_shape_available(shape_name: str, region: str) -> bool:
-    shape_name = shape_name.split(":")[0]
+    shape_name = shape_name.split(":", maxsplit=1)[0]
     compute_client = OciService().get_compute_client(region=region)
     shapes = oci.pagination.list_call_get_all_results_generator(
         compute_client.list_shapes,
@@ -933,6 +956,28 @@ def build_hostname_label(name: str, default_hostname: str = "node") -> str:
     max_base_len = 63 - len(suffix)
     hostname = hostname[:max_base_len].strip("-") or default_hostname
     return f"{hostname}{suffix}"
+
+
+def build_image_source_details(
+    image_id: str, root_disk_size_gb: int | None, name: str = ""
+) -> InstanceSourceViaImageDetails:
+    """Pair an image with an explicit boot volume size.
+
+    `LaunchInstanceDetails' has no root disk field, so a bare `image_id' makes OCI size the boot volume
+    from the image itself and silently drop whatever root disk size was configured. OCI also refuses
+    anything under `MIN_BOOT_VOLUME_SIZE_IN_GBS', so a smaller request is raised to that floor rather
+    than failing the launch.
+    """
+    requested_gb = root_disk_size_gb or MIN_BOOT_VOLUME_SIZE_IN_GBS
+    boot_volume_size_in_gbs = max(requested_gb, MIN_BOOT_VOLUME_SIZE_IN_GBS)
+    if boot_volume_size_in_gbs != requested_gb:
+        LOGGER.info(
+            "Requested %sG root disk%s is under the OCI %sG boot volume minimum, using the minimum",
+            requested_gb,
+            f" for '{name}'" if name else "",
+            MIN_BOOT_VOLUME_SIZE_IN_GBS,
+        )
+    return InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=boot_volume_size_in_gbs)
 
 
 def _get_images(region: str | None = None):
@@ -1037,3 +1082,151 @@ def get_scylla_images_by_version(
             ]
         )
     return rows
+
+
+SECONDARY_VNICS_SCRIPT_PATH = "/usr/local/sbin/sct-configure-secondary-vnics.sh"
+SECONDARY_VNICS_SERVICE = "sct-secondary-vnics"
+
+# OCI does not configure secondary VNICs in the guest OS at all: addresses, routes and source-based
+# policy routing rules all have to be installed by hand, or else replies sourced from a secondary
+# VNIC address leave through the primary VNIC default route and get dropped.
+# Everything is resolved from IMDS at runtime, so one script works for all the nodes and can safely
+# re-run after a reboot or an interface restart.
+#
+# Source-based policy routing is the method Oracle officially recommends for secondary VNICs:
+# https://docs.oracle.com/en-us/iaas/Content/Network/Tasks/managingVNICs.htm
+#
+# Arguments: $1 - number of VNICs to expect in IMDS, $2 - private IPv4 address of the primary VNIC.
+SECONDARY_VNICS_SCRIPT = r"""#!/bin/bash
+# auto-generated by SCT - addresses and policy routing for secondary OCI VNICs
+set -euo pipefail
+
+EXPECTED_VNICS="${1:?number of expected VNICs is required}"
+PRIMARY_IP="${2:?private IP of the primary VNIC is required}"
+
+# --retry-all-errors also retries connection failures during early boot, but needs curl >= 7.71
+RETRY_ALL_ERRORS=$(curl --retry-all-errors --version >/dev/null 2>&1 && echo --retry-all-errors || true)
+
+imds_fetch() {
+    curl -sf --connect-timeout 10 --retry 5 --retry-max-time 60 $RETRY_ALL_ERRORS \
+        -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/vnics/
+}
+
+# IMDS may lag behind the OCI API after a VNIC attachment, so wait until all the VNICs show up.
+# A failing fetch and an unparsable payload are both retried, but neither may be swallowed forever:
+# configuring only a subset of the VNICs leaves the node half-broken in a way that surfaces much
+# later, as a confusing connectivity or streaming failure.
+METADATA=""
+for _attempt in $(seq 1 30); do
+    if ! METADATA=$(imds_fetch); then
+        echo "IMDS query failed, retrying" >&2
+    elif ! VNIC_COUNT=$(echo "$METADATA" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))"); then
+        echo "IMDS returned an unparsable VNIC list, retrying" >&2
+    elif [ "$VNIC_COUNT" -ge "$EXPECTED_VNICS" ]; then
+        break
+    else
+        echo "IMDS reports $VNIC_COUNT of $EXPECTED_VNICS VNIC(s), retrying" >&2
+    fi
+    METADATA=""
+    sleep 2
+done
+if [ -z "$METADATA" ]; then
+    echo "IMDS did not return a usable VNIC list for all the $EXPECTED_VNICS VNIC(s) after 30 attempts" >&2
+    exit 1
+fi
+
+echo "$METADATA" | python3 -c '
+import json, subprocess, sys
+
+expected_vnics, primary_ip = int(sys.argv[1]), sys.argv[2]
+vnics = json.load(sys.stdin)
+failures = []
+
+
+def run(*command):
+    # Run an "ip" command, recording anything but a success as a failure.
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode:
+        failures.append(" ".join(command) + ": " + (result.stderr.strip() or str(result.returncode)))
+
+
+def replace_rule(family, selector, table):
+    # "ip rule" has no "replace" counterpart, and every "del" removes a single match, so drain
+    # whatever a previous run of this script stacked up before adding the rule back exactly once.
+    for _ in range(16):
+        drained = subprocess.run(
+            family + ["rule", "del"] + selector + ["lookup", table], capture_output=True, check=False
+        )
+        if drained.returncode:
+            break
+    else:
+        failures.append("failed to drain the duplicate ip rules for " + " ".join(selector))
+    run(*(family + ["rule", "add"] + selector + ["lookup", table, "priority", table]))
+
+
+def resolve_iface(mac):
+    # "check=True" on purpose: a broken "ip" binary must fail the whole script, not skip a VNIC.
+    output = subprocess.run(["ip", "-o", "link"], capture_output=True, text=True, check=True).stdout
+    for line in output.splitlines():
+        if mac.lower() in line.lower():
+            return line.split(": ")[1].rstrip()
+    return ""
+
+
+configured = 0
+for idx, vnic in enumerate(vnics):
+    pip, mac = vnic.get("privateIp", ""), vnic.get("macAddr", "")
+    virtual_router, cidr = vnic.get("virtualRouterIp", ""), vnic.get("subnetCidrBlock", "")
+    if pip == primary_ip:
+        continue
+    if not all([pip, mac, virtual_router, cidr]):
+        failures.append(f"VNIC #{idx} metadata is incomplete: {vnic}")
+        continue
+    if not (iface := resolve_iface(mac)):
+        failures.append(f"no OS device with MAC {mac} (VNIC #{idx})")
+        continue
+
+    # table 100+N keeps clear of the reserved tables and of the primary VNIC routes
+    table = str(100 + idx)
+    # the device must be up before any address or route referencing it gets installed
+    run("ip", "link", "set", "dev", iface, "up")
+    run("ip", "addr", "replace", pip + "/" + cidr.split("/")[-1], "dev", iface)
+    replace_rule(["ip"], ["from", pip], table)
+    run("ip", "route", "replace", "default", "via", virtual_router, "dev", iface, "table", table)
+    run("ip", "route", "replace", cidr, "dev", iface, "table", table)
+
+    for addr in vnic.get("ipv6Addresses", []):
+        run("ip", "-6", "addr", "replace", addr + "/128", "dev", iface)
+        replace_rule(["ip", "-6"], ["from", addr], table)
+    if ipv6_virtual_router := vnic.get("ipv6VirtualRouterIp", ""):
+        run("ip", "-6", "route", "replace", "default", "via", ipv6_virtual_router, "dev", iface, "table", table)
+    for ipv6_cidr in vnic.get("ipv6SubnetCidrBlocks", []):
+        run("ip", "-6", "route", "replace", ipv6_cidr, "dev", iface, "table", table)
+
+    configured += 1
+
+for failure in failures:
+    print(failure, file=sys.stderr)
+if configured < expected_vnics - 1:
+    print(f"configured only {configured} of the {expected_vnics - 1} secondary VNIC(s)", file=sys.stderr)
+    sys.exit(1)
+if failures:
+    sys.exit(1)
+print(f"configured addresses and policy routing for {configured} secondary VNIC(s)")
+' "$EXPECTED_VNICS" "$PRIMARY_IP"
+"""
+
+SECONDARY_VNICS_SERVICE_UNIT_TMPL = """\
+[Unit]
+Description=SCT secondary VNIC configuration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={script_path} {nic_count} {primary_ip}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""

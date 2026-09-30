@@ -14,7 +14,10 @@ test_metadata:
     - NoOpMonkey
 backtrace_decoding: false
 cluster_backend: 'aws'
-instance_type_db: 'i4i.large'
+sizing_db:
+  vcpu: 2
+  memory: '>=16'
+  arch: x86_64
 instance_provision: "spot"
 instance_provision_fallback_on_demand: true
 n_db_nodes: 1

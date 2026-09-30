@@ -33,6 +33,7 @@ For plan writing guidelines, see [INSTRUCTIONS.md](INSTRUCTIONS.md).
 | Multi-Cloud Provisioning Resilience | `draft` | [multi-cloud-provisioning-resilience.md](infrastructure/multi-cloud-provisioning-resilience.md) |
 | AWS Capacity AZ Fallback | `draft` | [aws-capacity-az-fallback.md](infrastructure/aws-capacity-az-fallback.md) |
 | NVMe Diagnostics Collection | `draft` | [nvme-diagnostics-collection.md](infrastructure/nvme-diagnostics-collection.md) |
+| Azure Multi-VNIC Support | `complete` | [azure-multi-vnic-support.md](infrastructure/azure-multi-vnic-support.md) |
 
 ### Nemesis — Chaos engineering, disruptors
 
@@ -41,6 +42,7 @@ For plan writing guidelines, see [INSTRUCTIONS.md](INSTRUCTIONS.md).
 | Nemesis Rework (Nemesis 2.0) | `in_progress` | [nemesis-rework.md](nemesis/nemesis-rework.md) |
 | Nemesis Extraction Phase 3 | `in_progress` | [nemesis-extraction.md](nemesis/nemesis-extraction.md) |
 | Nemesis Pre-Execution Skip Check (`precheck`) | `in_progress` | [nemesis-precheck.md](nemesis/nemesis-precheck.md) |
+| Preserve Coredumps During Out-of-Space Nemesis | `draft` | [coredump-preservation-oos-nemesis.md](nemesis/coredump-preservation-oos-nemesis.md) |
 
 ### Stress Tools — Load generators
 
@@ -80,7 +82,8 @@ For plan writing guidelines, see [INSTRUCTIONS.md](INSTRUCTIONS.md).
 
 | Plan | Status | File / PR |
 |------|--------|-----------|
-| Health Check Optimization | `draft` | [health-check-optimization.md](infrastructure/health-check-optimization.md) |
+| Health Check Optimization | `in_progress` | [health-check-optimization.md](infrastructure/health-check-optimization.md) |
+| Health Check Node Sampling | `draft` | [health-check-sampling.md](infrastructure/health-check-sampling.md) |
 | Feature-Aware Adaptive Timeouts for Topology Operations | `draft` | [feature-aware-adaptive-topology-timeouts.md](infrastructure/feature-aware-adaptive-topology-timeouts.md) |
 | Full Version Tag Lookup | `draft` | [full-version-tag-lookup.md](config/full-version-tag-lookup.md) |
 | Keystore Improvements | `pending_pr` | [#14055](https://github.com/scylladb/scylla-cluster-tests/pull/14055) |
@@ -104,6 +107,7 @@ For plan writing guidelines, see [INSTRUCTIONS.md](INSTRUCTIONS.md).
 | Dependent Plan | Depends On | Relationship |
 |---------------|------------|--------------|
 | Nemesis Extraction Phase 3 | Nemesis Rework | Phase 3 continues the extraction started in Nemesis 2.0 |
+| Health Check Node Sampling | Health Check Optimization | Sampling is gated on the optimization plan's measured baseline; its go/no-go depends on how much time is left to win |
 | Pipeline Labeling and Documentation | Jenkins Pipeline Config Linter | Labeling complements structural config linting; may reuse Jenkinsfile parser |
 | SCT Config Follow-up Refactoring | SCT Config Validation and Lazy Images | Follow-up work after initial config validation |
 | Typed Config Access Migration | SCT Config Follow-up Refactoring | Type safety layer on top of refactored config |

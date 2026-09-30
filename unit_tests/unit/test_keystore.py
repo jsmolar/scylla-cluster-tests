@@ -128,7 +128,6 @@ FAKE_GCP_SERVICE_ACCOUNTS = [
 FAKE_SCYLLADB_UPLOAD = {"bucket": "uploads", "key": "fake-key"}
 FAKE_QA_USERS = [{"username": "qa_user_1", "password": "pass1"}]
 FAKE_ACL_GRANTEES = [{"id": "user1", "permission": "FULL_CONTROL"}]
-FAKE_HOUSEKEEPING_DB = {"host": "db.example.com", "user": "admin", "password": "dbpass"}
 FAKE_LDAP_MS_AD = {"host": "ldap.example.com", "user": "admin", "password": "ldappass"}
 FAKE_BACKUP_AZURE_BLOB = {"account_name": "sctbackup", "account_key": "fake-key"}
 FAKE_DOCKER_HUB = {"username": "docker_user", "password": "docker_pass"}
@@ -168,7 +167,6 @@ def _populate_bucket(s3_resource):
         "scylladb_upload.json": FAKE_SCYLLADB_UPLOAD,
         "qa_users.json": FAKE_QA_USERS,
         "bucket-users.json": FAKE_ACL_GRANTEES,
-        "housekeeping-db.json": FAKE_HOUSEKEEPING_DB,
         "ldap_ms_ad.json": FAKE_LDAP_MS_AD,
         "backup_azure_blob.json": FAKE_BACKUP_AZURE_BLOB,
         "docker.json": FAKE_DOCKER_HUB,
@@ -203,6 +201,18 @@ def mocked_s3():
         s3 = boto3.resource("s3", region_name="us-east-1")
         _populate_bucket(s3)
         yield s3
+
+
+@pytest.fixture(autouse=True)
+def _clear_keystore_cache():
+    """The cache is process-wide, so it has to be dropped between tests.
+
+    Without this, `test_bypass_cache_updates_cached_value` (which rewrites `email_config.json` in
+    the bucket and then restores it) leaves the rewritten bytes cached for every later test.
+    """
+    KeyStore.clear_cache(KeyStore())
+    yield
+    KeyStore.clear_cache(KeyStore())
 
 
 @pytest.fixture
@@ -361,9 +371,6 @@ class TestCredentialGetters:
 
     def test_acl_grantees(self, ks):
         assert ks.get_acl_grantees() == FAKE_ACL_GRANTEES
-
-    def test_housekeeping_db(self, ks):
-        assert ks.get_housekeeping_db_credentials() == FAKE_HOUSEKEEPING_DB
 
     def test_ldap_ms_ad(self, ks):
         assert ks.get_ldap_ms_ad_credentials() == FAKE_LDAP_MS_AD
@@ -751,13 +758,55 @@ class TestCaching:
             ks.get_file_contents("azure.json")
             assert mock_fetch.call_count == 2
 
-    def test_cache_is_per_instance(self, mocked_s3):
+    def test_cache_is_shared_between_instances(self, mocked_s3):
+        """The whole point: nothing in SCT keeps a KeyStore, so a per-instance cache never hit."""
         ks1 = KeyStore()
         ks2 = KeyStore()
         ks1.get_file_contents("email_config.json")
         with patch.object(ks2, "_fetch_from_s3", wraps=ks2._fetch_from_s3) as mock_fetch:
             ks2.get_file_contents("email_config.json")
-            mock_fetch.assert_called_once()
+            mock_fetch.assert_not_called()
+
+    def test_the_real_call_shape_only_fetches_once(self, mocked_s3):
+        """`KeyStore().get_json(...)` repeated is how every call site in SCT is actually written."""
+        with patch.object(KeyStore, "_fetch_from_s3", autospec=True, side_effect=KeyStore._fetch_from_s3) as fetch:
+            for _ in range(4):
+                KeyStore().get_json("email_config.json")
+        assert fetch.call_count == 1
+
+    def test_backends_do_not_serve_each_others_bytes(self, mocked_s3, monkeypatch):
+        """A name means different content per backend, so the key cannot be the name alone."""
+        s3_store = KeyStore(backend="s3")
+        s3_store.get_file_contents("email_config.json")
+
+        sm_store = KeyStore(backend="secretsmanager")
+        with patch.object(sm_store, "_fetch_from_secrets_manager", return_value=b"{}") as sm_fetch:
+            sm_store.get_file_contents("email_config.json")
+            sm_fetch.assert_called_once(), "the S3 entry must not satisfy a Secrets Manager read"
+
+    def test_prefix_is_part_of_the_key(self, mocked_s3, monkeypatch):
+        """`SCT_KEYSTORE_SM_PREFIX` selects a different secret for the same file name."""
+        monkeypatch.setenv("SCT_KEYSTORE_BACKEND", "secretsmanager")
+        monkeypatch.setenv("SCT_KEYSTORE_SM_PREFIX", "prod/")
+        with patch.object(KeyStore, "_fetch_from_secrets_manager", return_value=b"{}") as fetch:
+            KeyStore().get_file_contents("email_config.json")
+            monkeypatch.setenv("SCT_KEYSTORE_SM_PREFIX", "staging/")
+            KeyStore().get_file_contents("email_config.json")
+        assert fetch.call_count == 2
+
+    def test_endpoint_url_is_part_of_the_key(self, mocked_s3, monkeypatch):
+        """Bytes read through a moto/emulator endpoint must not be served once it is unset.
+
+        The integration suite seeds a moto keystore with fake credentials; with the endpoint out of
+        the key, every later module got those fakes and sent them to real AWS and GCE.
+        """
+        monkeypatch.setenv("SCT_KEYSTORE_BACKEND", "secretsmanager")
+        with patch.object(KeyStore, "_fetch_from_secrets_manager", side_effect=[b"fake", b"real"]) as fetch:
+            monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:5000")
+            assert KeyStore().get_file_contents("aws_images_role.json") == b"fake"
+            monkeypatch.delenv("AWS_ENDPOINT_URL")
+            assert KeyStore().get_file_contents("aws_images_role.json") == b"real"
+        assert fetch.call_count == 2
 
     def test_cache_thread_safe(self, ks):
         results = []
@@ -1052,7 +1101,7 @@ class TestAccessLogging:
         body = MagicMock()
         body.read.return_value = data
         mock_obj = MagicMock()
-        mock_obj.get.side_effect = lambda: (time.sleep(0.05) or {"Body": body})  # force small delay
+        mock_obj.get.side_effect = lambda: time.sleep(0.05) or {"Body": body}  # force small delay
         mock_s3 = MagicMock()
         mock_s3.Object.return_value = mock_obj
 

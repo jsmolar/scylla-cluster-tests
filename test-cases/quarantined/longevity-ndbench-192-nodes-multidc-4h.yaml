@@ -1,0 +1,58 @@
+# Quarantined: the ndbench longevity configs are not in use and their
+# pipelines have been removed. See jenkins-pipelines/quarantined/README.md.
+test_metadata:
+  description: >-
+    4-hour scale test driven by ndbench on a 192-node, 2-region cluster (96 nodes each in us-east-1
+    and eu-west-1) with 64 loaders, rate-limited reads and writes at LOCAL_QUORUM, internode
+    encryption and compression, and no nemesis. The largest node-count configuration in the longevity
+    suite.
+  test_type: longevity
+  tier: ondemand
+  duration_class: short
+  supported_backends:
+    - aws
+  stress_tools:
+    - ndbench
+  workload: mixed
+  nemesis_labels:
+    - NoOpMonkey
+  features:
+    - multi-dc
+    - rack-aware
+    - tls-ssl
+  team_ownership: core-test-infra
+
+test_duration: 240
+
+prepare_write_cmd: >-
+  ndbench cli.clientName=CassJavaDriverGeneric ; numKeys=20971520 ; numValues=10 ; dataSize=512 ; cass.colsPerRow=10;
+  readEnabled=true; numReaders=60; numWriters=60 ; cass.writeConsistencyLevel=LOCAL_QUORUM ; generateChecksum=true;
+  cli.timeoutMillis=14400000; writeRateLimit=2700 ; readRateLimit=3000
+
+stress_cmd: >-
+  ndbench cli.clientName=CassJavaDriverGeneric ; numKeys=20971520 ; numValues=10 ; dataSize=512 ; cass.colsPerRow=10;
+  readEnabled=true; numReaders=60; numWriters=60 ; cass.writeConsistencyLevel=LOCAL_QUORUM ; generateChecksum=true;
+  cli.timeoutMillis=14400000; writeRateLimit=18000 ; readRateLimit=1350
+
+region_name: 'us-east-1 eu-west-1'
+n_db_nodes: '96 96'
+n_loaders: '32 32'
+
+rack_aware_loader: true
+region_aware_loader: true
+simulated_racks: 0
+
+sizing_db:  # no OCI match (DenseIO min 16 vCPUs)
+  vcpu: 4
+  memory: '>=32'
+sizing_loader:
+  vcpu: 16
+  memory: '>=32'
+
+user_prefix: 'longevity-ndbench-multi-dc'
+space_node_threshold: 64424
+
+internode_compression: 'all'
+internode_encryption: 'dc'
+
+nemesis_class_name: 'NoOpMonkey'

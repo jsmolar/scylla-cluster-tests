@@ -51,14 +51,24 @@ uv run sct.py integration-tests
 
 ### Code Quality and Linting
 
+**REQUIRED:** All pre-commit checks must pass before committing code.
+
 ```bash
-# Run pre-commit checks (includes autopep8, ruff, and other linters)
+# Run pre-commit checks (includes ruff-format, ruff, uv-sort, and other linters)
 uv run sct.py pre-commit
 
 # Run specific linters
 ruff check --fix --preview .
-autopep8 -i -j 2 <file>
+ruff format .
 ```
+
+Pre-commit checks include:
+- Code formatting (ruff-format)
+- Linting (ruff with all enabled rules)
+- Dependency sorting (uv-sort)
+- YAML validation
+- Trailing whitespace removal
+- End-of-file fixes
 
 ### Running SCT
 
@@ -115,7 +125,7 @@ export SCT_REUSE_CLUSTER=$(cat ~/sct-results/latest/test_id)
 | Cluster management | `cluster.py`, `cluster_aws.py`, `cluster_gce.py`, `cluster_azure.py`, `cluster_docker.py`, `cluster_k8s/` | Base classes and backend-specific implementations |
 | Test base | `tester.py` | Base test class, setup/teardown, reporting |
 | Nemesis (chaos) | `nemesis/` package — see [docs/nemesis.md](docs/nemesis.md) | `NemesisBaseClass`, `NemesisRunner`, `NemesisRegistry`, auto-discovery |
-| Configuration | `sct_config.py` | Parameter handling; precedence: CLI > env vars > config files > defaults |
+| Configuration | `sdcm/sct_config/` | Parameter handling; precedence: CLI > env vars > config files > defaults |
 | Stress tools | `stress/`, `*_thread.py` | Wrappers for cassandra-stress, scylla-bench, YCSB, gemini, latte |
 | Remote execution | `remote/` | SSH, Docker, and K8s command runners |
 | Provisioning | `provision/` | Cloud-specific infra provisioning (AWS, Azure, GCE) |
@@ -186,13 +196,17 @@ A pruned nemesis emits exactly one `SKIPPED` Argus row at precheck time. If ever
 - Start with existing test cases in `test-cases/` as templates
 - Use configuration fragments from `configurations/` for common settings
 - Network configs are in `configurations/network_config/`
+- If the test deliberately pins a setting (compaction strategy, compression, TTL, `gc_grace_seconds`, a `scylla.yaml` option), exclude the nemesis that rewrite it by name in `nemesis_selector`, e.g. `'not ModifyTableCompressionMonkey'`. Otherwise a nemesis silently undoes the setting mid-run. See [Turning Off Nemesis That Break the Test's Goal](docs/nemesis.md#turning-off-nemesis-that-break-the-tests-goal).
 
 ### Development Workflow
 1. Create feature branch from master
 2. Run unit tests locally: `uv run sct.py unit-tests`
 3. Test with docker backend first: `--backend docker`
 4. Use cluster reuse for faster iteration
-5. Run pre-commit before commit, and after commit: `uv run sct.py pre-commit`
+5. **REQUIRED:** Run pre-commit checks before committing code: `uv run sct.py pre-commit`
+   - All pre-commit checks must pass before code can be committed
+   - Pre-commit runs formatting (ruff-format), linting (ruff), and other code quality checks
+   - If pre-commit modifies files, review the changes and re-run until all checks pass
 
 ### Debugging SCT Tests
 - Check logs in `~/sct-results/latest/`
@@ -212,6 +226,10 @@ A pruned nemesis emits exactly one `SKIPPED` Argus row at precheck time. If ever
 Separate each group with a blank line.
 Within each group, sort imports alphabetically.
 
+**Logging convention:**
+- Use uppercase `LOGGER` for module-level loggers: `LOGGER = logging.getLogger(__name__)`
+- This ensures consistency across the codebase
+
 **HTTP/Curl Conventions:**
 - All `remoter.run("curl ...")` calls must use `curl_with_retry()` from `sdcm/utils/curl.py`
 - `curl_with_retry()` retries connection resets (curl exit 35/56, which plain `--retry` does NOT retry) by default: it adds `--retry-all-errors` through `RETRY_ALL_ERRORS_PROBE`, a runtime capability check that expands to nothing on distros with curl < 7.71 - safe on any node
@@ -221,6 +239,8 @@ Within each group, sort imports alphabetically.
 - All `requests` calls must go through a session with retry adapter (pattern: `sdcm/rest/rest_client.py`)
 - Localhost calls may use `retry=0` but must still use the utility for consistent `--connect-timeout`
 - Document any exceptions with `# no-retry: <reason>` comments
+
+Full reference (defaults, probe rationale, curl-in-bash patterns, compliance greps): [docs/http-retry-conventions.md](docs/http-retry-conventions.md)
 
 ### Method Signature Changes (Override Safety)
 
@@ -334,6 +354,7 @@ Modular, task-specific guidance for AI agents lives in the `skills/` directory. 
 | reviewing-pipeline-docs | Guides reviewing and generating test_metadata sections for SCT test-case YAML files. Use when adding or auditing test_metadata, checking description/tier/labels accuracy, or running lint-test-docs. | `skills/reviewing-pipeline-docs/SKILL.md` |
 | labeling-pipelines | Guides bulk-labeling and linting test-case YAML files with test_metadata. Use when finding coverage gaps, auto-fixing mismatches, or auditing label accuracy across a directory. | `skills/labeling-pipelines/SKILL.md` |
 | stack-sync | Manage stacked PRs via the gh-stack CLI extension (native GitHub stacked PR support). Use when splitting a large change into a chain of small reviewable PRs, checking stack status, or syncing/rebasing/merging stack layers. | `skills/stack-sync/SKILL.md` |
+| downscaling-for-minicloud | Guides shrinking an SCT test-case so it runs against minicloud, the local QEMU/KVM cloud emulator, on a single host. Use when validating a change locally before spending cloud time, fitting a test-case into host RAM, writing a configurations/minicloud overlay, or triaging a local run. | `skills/downscaling-for-minicloud/SKILL.md` |
 
 When creating a new skill, follow the process in `skills/designing-skills/workflows/create-a-skill.md`.
 

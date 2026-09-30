@@ -82,7 +82,7 @@ def call(Map pipelineParams) {
 
             separator(name: 'SCYLLA_DB', sectionHeader: 'ScyllaDB Configuration Selection')
             string(defaultValue: '', description: 'AMI ID for ScyllaDB ', name: 'scylla_ami_id')
-            string(defaultValue: "${pipelineParams.get('scylla_version', '2026.2')}",
+            string(defaultValue: "${pipelineParams.get('scylla_version', '2026.3')}",
                    description: 'Version of ScyllaDB to run against. Can be a released version (2025.4) or a master (master:latest)',
                    name: 'scylla_version')
             // When branching to manager version branch, set scylla_version to the latest release
@@ -454,14 +454,16 @@ def call(Map pipelineParams) {
                                         [$class: 'StringParameterValue', name: 'target_scylla_mgmt_server_address', value: params.scylla_mgmt_address],
                                         [$class: 'StringParameterValue', name: 'target_scylla_mgmt_agent_address', value: params.scylla_mgmt_agent_address],
                                         [$class: 'StringParameterValue', name: 'TARGET_MANAGER_VERSION', value: params.manager_version],
-                                        [$class: 'StringParameterValue', name: 'provision_type', value: params.provision_type]
+                                        [$class: 'StringParameterValue', name: 'provision_type', value: params.provision_type],
+                                        [$class: 'StringParameterValue', name: 'requested_by_user', value: params.requested_by_user]
                                     ]
                                 } else {
                                     repoParams = [
                                         [$class: 'StringParameterValue', name: 'scylla_mgmt_address', value: params.scylla_mgmt_address],
                                         [$class: 'StringParameterValue', name: 'scylla_mgmt_agent_address', value: params.scylla_mgmt_agent_address],
                                         [$class: 'StringParameterValue', name: 'manager_version', value: params.manager_version],
-                                        [$class: 'StringParameterValue', name: 'provision_type', value: params.provision_type]
+                                        [$class: 'StringParameterValue', name: 'provision_type', value: params.provision_type],
+                                        [$class: 'StringParameterValue', name: 'requested_by_user', value: params.requested_by_user]
                                     ]
                                 }
                                 triggerJob(fullJobPath, repoParams)

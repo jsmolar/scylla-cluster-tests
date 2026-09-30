@@ -49,7 +49,7 @@ from argus.common.sct_types import RawEventPayload
 import sct_sizing
 import sct_ssh
 import sct_scan_issues
-from sdcm.cloud_api_client import ScyllaCloudAPIClient
+from sdcm.cloud_api_client import ScyllaCloudAPIClient, CloudProviderType
 from sdcm.cluster_cloud import extract_short_test_id_from_name
 from sdcm.keystore import KeyStore
 from sdcm.localhost import LocalHost
@@ -124,6 +124,7 @@ from sdcm.utils.common import (
     get_hdr_tags,
     download_and_unpack_logs,
     find_equivalent_ami,
+    get_testrun_dir,
 )
 from sdcm.nemesis.generator import generate_nemesis_yaml, NemesisJobGenerator
 from sdcm.utils.open_with_diff import OpenWithDiff, ErrorCarrier
@@ -139,6 +140,7 @@ from sdcm.utils.minicloud import (
     MinicloudConfig,
     MinicloudManager,
     check_minicloud_reachability,
+    collect_minicloud_guest_serial_logs,
     collect_minicloud_logs,
     ensure_minicloud_ready,
     get_minicloud_endpoint,
@@ -1521,6 +1523,55 @@ def list_repos(dist_type, dist_version):
     click.echo(rich_table_to_string(tbl, title="Scylla Repos"))
 
 
+@cli.command("list-cloud-zones", help="List ScyllaDB Cloud availability zones of a provider region")
+@click.option(
+    "--xcloud-env",
+    type=str,
+    default="staging",
+    help="ScyllaDB Cloud environment to query. Defaults to staging",
+)
+@click.option("--cloud-provider", type=click.Choice(["aws", "gce"]), default="aws", help="Cloud provider to query")
+@click.option("--region", type=str, required=True, help="Region to query, eg: us-east-1, us-east1")
+@click.option(
+    "--instance-type",
+    type=str,
+    default=None,
+    help="Only list zones where this instance type can be deployed, eg: i4i.large",
+)
+def list_cloud_zones(xcloud_env, cloud_provider, region, instance_type):
+    add_file_logger()
+
+    credentials = KeyStore().get_cloud_rest_credentials(xcloud_env)
+    api_client = ScyllaCloudAPIClient(api_url=credentials["base_url"], auth_token=credentials["api_token"])
+
+    provider_id = api_client.cloud_provider_ids[CloudProviderType.from_sct_backend(cloud_provider)]
+    region_id = api_client.get_region_id_by_name(cloud_provider_id=provider_id, region_name=region)
+
+    instance_type_id = None
+    if instance_type:
+        instance_type_id = api_client.get_instance_id_by_name(
+            cloud_provider_id=provider_id, region_id=region_id, instance_type_name=instance_type
+        )
+    zones = api_client.get_availability_zones(
+        cloud_provider_id=provider_id, region_id=region_id, instance_type_id=instance_type_id
+    )
+
+    if not zones:
+        click.secho(f"No availability zones found for '{cloud_provider}' region '{region}'!", fg="yellow")
+        return
+
+    # the AZ id is what 'xcloud_availability_zones' expects; the name is the account-specific alias
+    tbl = Table("AZ ID", "AZ name", show_lines=False)
+    for zone in zones:
+        tbl.add_row(zone["id"], zone["name"])
+
+    title = f"ScyllaDB Cloud availability zones ({xcloud_env}, {cloud_provider}, {region})"
+    if instance_type:
+        title += f" for {instance_type}"
+    click.echo(rich_table_to_string(tbl, title=title))
+    click.secho(f"Use the AZ ID column as SCT_XCLOUD_AVAILABILITY_ZONES, eg: {zones[0]['id']}", fg="green")
+
+
 @cli.command("get-scylla-base-versions", help="Get Scylla base versions of upgrade")
 @click.option("-s", "--scylla-version", type=str, help="Scylla version, eg: 4.5, 2021.1")
 @click.option("-r", "--scylla-repo", type=str, help="Scylla repo")
@@ -1814,6 +1865,9 @@ def _write_junit_xml(junit_xml_path, tasks, failures, total, failed_count, skipp
     click.echo(f"JUnit XML report written to {junit_xml_path}")
 
 
+MAX_LINT_WORKERS = 8
+
+
 @cli.command("lint-pipelines", help="Validate configurations from Jenkins pipeline files")
 @click.option("--pipeline-dir", default="jenkins-pipelines", help="Root directory of pipeline files")
 @click.option("--pipeline-file", default=None, help="Validate a single pipeline file (ad-hoc mode)")
@@ -1853,7 +1907,7 @@ def lint_pipelines(pipeline_dir, pipeline_file, workers, include_filter, exclude
         click.echo("No pipeline files to validate.")
         sys.exit(0)
 
-    worker_count = workers or os.cpu_count() or 4
+    worker_count = workers or min(os.cpu_count() or 4, MAX_LINT_WORKERS)
     show_progress = sys.stderr.isatty()
 
     failed_count = 0
@@ -2018,7 +2072,7 @@ def conf(config_file, backend):
         config.verify_configuration()
         config.check_required_files()
     except Exception as ex:
-        logging.exception(str(ex))
+        LOGGER.exception(str(ex))
         click.secho(str(ex), fg="red")
         sys.exit(1)
     else:
@@ -2039,9 +2093,26 @@ def conf_docs(output_format):
 
 @cli.command("update-conf-docs", help="Update the docs configuration markdown")
 def update_conf_docs():
-    markdown_file = Path(__name__).parent / "docs" / "configuration_options.md"
-    markdown_file.write_text(SCTConfiguration.dump_help_config_markdown())
-    click.secho(f"docs written into {markdown_file}")
+    root = Path(__name__).parent
+    pages = SCTConfiguration.dump_help_config_markdown_pages()
+
+    docs_dir = root / SCTConfiguration.DOCS_DIR
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    written = set()
+    for rel_path, content in pages.items():
+        path = root / rel_path
+        # trailing newline, or pre-commit's end-of-file-fixer rewrites every page on each run
+        path.write_text(content.rstrip("\n") + "\n")
+        written.add(path.resolve())
+
+    # a renamed or removed group would otherwise leave an orphan page behind
+    for stale in docs_dir.glob("*.md"):
+        if stale.resolve() not in written:
+            stale.unlink()
+            click.secho(f"removed stale {stale}", fg="yellow")
+
+    click.secho(f"docs written: {len(pages)} pages under {docs_dir} (index: {root / SCTConfiguration.DOCS_INDEX})")
 
 
 @click.group(help="Group of commands for investigating testrun")
@@ -2174,8 +2245,9 @@ def show_monitor(test_id, date_time, kill, cluster_name):
         LOGGER.error(details)
 
     if not containers:
+        # restore_monitoring_stack() already removed the containers it started; killing the default-port
+        # containers here could take down a concurrent restore's stack
         click.echo("Errors were found when restoring Scylla monitoring stack")
-        kill_running_monitoring_stack_services()
         sys.exit(1)
 
     for cluster, containers_ports in containers.items():
@@ -2490,23 +2562,46 @@ def collect_logs(test_id=None, logdir=None, backend=None, config_file=None):
 
     config = SCTConfiguration()
 
+    if not test_id:
+        test_id = config.get("test_id")
+        if test_id:
+            LOGGER.info("Using test_id from SCT configuration: %s", test_id)
+
+    if not test_id and logdir:
+        # The pipeline exports SCT_TEST_ID build-wide, so --logdir alone is enough there
+        # (vars/runCollectLogs.groovy). A local run has no such export, and without an id
+        # Collector leaves collector.test_id None - which surfaces much later as
+        # update_sct_runner_tags() raising about a runner a local run never had, after
+        # collection has already done its work. The run dir always holds the id.
+        test_id_file = Path(logdir) / "test_id"
+        if test_id_file.exists():
+            test_id = test_id_file.read_text(encoding="utf-8").strip()
+            LOGGER.info("Using test_id from %s: %s", test_id_file, test_id)
+
     if is_minicloud_active(config):
         # After SCTConfiguration so yaml-only activation is seen, and the SDK endpoint
         # is exported before Collector runs — in a fresh collect-logs process
         # SCT_MINICLOUD_ENDPOINT_URL alone is invisible to the AWS/GCE SDKs, so
         # collection would otherwise query the real cloud.
         set_minicloud_endpoint_env(get_minicloud_endpoint(config), _minicloud_backend(backend))
+        minicloud_config = MinicloudConfig.from_env(params=config)
+        # Write into the run's own logdir — the one Collector globs — not
+        # get_test_config().logdir(), which in this fresh process is a brand-new
+        # timestamped dir that Collector never looks at, so everything landed there was
+        # silently dropped. Resolve it the same way Collector does (sdcm/logcollector.py
+        # Collector.sct_result_dir / run), so the two cannot drift apart; fall back to the
+        # fresh logdir only when the run dir cannot be located at all.
+        minicloud_logdir = (
+            get_testrun_dir(logdir or os.path.join(os.environ.get("HOME"), "sct-results"), test_id)
+            or get_test_config().logdir()
+        )
         # Collect only — never ensure_minicloud_ready() here: its auto-start does
         # `docker rm -f` on a crashed container, destroying the very evidence
         # (exit code, container logs) this command exists to collect.
-        collect_minicloud_logs(
-            get_test_config().logdir(), container_name=MinicloudConfig.from_env(params=config).container_name
-        )
-
-    if not test_id:
-        test_id = config.get("test_id")
-        if test_id:
-            LOGGER.info("Using test_id from SCT configuration: %s", test_id)
+        collect_minicloud_logs(minicloud_logdir, container_name=minicloud_config.container_name)
+        # The guests' serial consoles: the only record of a node SCT could never reach,
+        # and the emulator keeps them after the instance is gone.
+        collect_minicloud_guest_serial_logs(minicloud_logdir, state_dir=minicloud_config.state_dir)
 
     collector = Collector(test_id=test_id, params=config, test_dir=logdir)
 
@@ -2530,8 +2625,13 @@ def collect_logs(test_id=None, logdir=None, backend=None, config_file=None):
     click.echo(rich_table_to_string(table, title=f"Collected logs by test-id: {collector.test_id}"))
     update_sct_runner_tags(backend=backend, test_id=collector.test_id, tags={"logs_collected": True})
 
-    # Always send collected logs to Argus, even if there were collection errors
-    if collector.test_id:
+    # Always send collected logs to Argus, even if there were collection errors - but only
+    # when the run registered with Argus in the first place. A local run with enable_argus
+    # off has no SCTTestRun to attach to, and store_logs_in_argus would log a full traceback
+    # ("No SCTTestRun found matching ...") at the end of an otherwise clean run.
+    if collector.test_id and not config.get("enable_argus"):
+        LOGGER.info("enable_argus is off for this run - skipping Argus log submission")
+    elif collector.test_id:
         store_logs_in_argus(
             test_id=UUID(collector.test_id),
             logs=collected_logs,
@@ -2647,6 +2747,7 @@ def create_operator_test_release_jobs(branch, username, password, sct_branch, sc
         create_freestyle_jobs=triggers,
         template_context={"release_version": get_latest_scylla_release(product="scylla-enterprise")},
     )
+    server.raise_on_failures()
 
 
 @cli.command("create-manager-test-release-jobs", help="Create pipeline jobs for a new scylla-manager branch/release")
@@ -2667,6 +2768,7 @@ def create_manager_test_release_jobs(branch, username, password, sct_branch, sct
         create_freestyle_jobs=triggers,
         template_context={"release_version": get_latest_scylla_release(product="scylla-enterprise")},
     )
+    server.raise_on_failures()
 
 
 @cli.command("create-qa-tools-jobs", help="Create pipeline jobs for a new scylla-operator branch/release")
@@ -2685,6 +2787,7 @@ def create_qa_tools_jobs(username, password, sct_branch, sct_repo, triggers):
     server.create_job_tree(
         f"{server.base_sct_dir}/jenkins-pipelines/qa", create_freestyle_jobs=triggers, job_name_suffix=""
     )
+    server.raise_on_failures()
 
 
 @cli.command("create-performance-jobs", help="Create pipeline jobs for performance")
@@ -2706,6 +2809,7 @@ def create_performance_jobs(username, password, sct_branch, sct_repo, triggers):
         create_freestyle_jobs=triggers,
         job_name_suffix="",
     )
+    server.raise_on_failures()
 
 
 @cli.command("create-nemesis-yaml")
@@ -2758,6 +2862,9 @@ def create_test_release_jobs(branch, username, password, sct_branch, sct_repo):
     if branch == "scylla-master":
         base_path = f"{server.base_sct_dir}/jenkins-pipelines/master-triggers"
         server.create_job_tree(base_path)
+
+    # every tree is walked before failing, so one bad job never hides the others
+    server.raise_on_failures()
 
 
 @cli.command(

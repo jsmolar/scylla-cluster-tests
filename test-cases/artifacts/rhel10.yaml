@@ -1,8 +1,26 @@
+test_metadata:
+  description: >-
+    Artifacts validation test that installs ScyllaDB from the RPM repository onto a stock Red Hat
+    Enterprise Linux 10 AMI (resolved from Red Hat's owner id) and runs the standard artifact smoke
+    checks. Backs both the x86_64 and the ARM RHEL 10 pipelines.
+  test_type: artifacts
+  tier: sanity
+  duration_class: short
+  supported_backends:
+    - aws
+  stress_tools: []
+  nemesis_labels:
+    - NoOpMonkey
+  team_ownership: core-test-infra
+
 backtrace_decoding: false
 cluster_backend: 'aws'
 ami_db_scylla_user: 'ec2-user'
 ami_id_db_scylla: 'resolve:owner:309956199498/x86_64/RHEL-10*x86_64*'
-instance_type_db: 'i4i.large'
+sizing_db:
+  vcpu: 2
+  memory: '>=16'
+  arch: x86_64
 root_disk_size_db: 50
 instance_provision: 'spot'
 instance_provision_fallback_on_demand: true

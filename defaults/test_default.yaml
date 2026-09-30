@@ -34,7 +34,7 @@ scylla_linux_distro: 'ubuntu-focal'
 scylla_linux_distro_loader: 'ubuntu-jammy'
 ssh_transport: 'libssh2'
 
-monitor_branch: 'branch-4.15'
+monitor_branch: 'branch-4.16'
 
 space_node_threshold: 0
 
@@ -297,7 +297,7 @@ kafka_backend: null
 kafka_connectors: []
 
 run_scylla_doctor: true
-scylla_doctor_version: "1.13"
+scylla_doctor_version: "1.14"
 scylla_doctor_full_tarball_url: null
 run_scylla_doctor_only: false
 scylla_doctor_edition: "basic"
@@ -405,6 +405,10 @@ minicloud_lightweight_memory: '4GiB'
 # One shard per vCPU. Both this and the memory above multiply across every guest in the test,
 # so the sct-runner (or dev host) has to be sized for the product.
 minicloud_lightweight_vcpus: 1
+# Extra OS memory for scylla-server via --reserve-memory.
+# By default, Scylla keeps about ~1.5 GiB on guests below ~22 GiB RAM, which can be too little
+# for sshd and SCT tools. Empty means do not pass this option (tests opt in).
+minicloud_scylla_reserve_memory: ''
 # Empty = no docker limit, the container may use the whole host. When set, this also becomes
 # the budget the preflight guest-memory gate measures against instead of host MemAvailable.
 minicloud_container_memory: ''
@@ -434,6 +438,7 @@ agent:
 
 c_s_driver_version: '3'
 cs_extra_jvm_opts: ''
+cs_safepoint_logging: false
 test_metadata: null
 
 # KeyStore backend for credential retrieval.

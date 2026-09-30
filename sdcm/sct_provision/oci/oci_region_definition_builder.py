@@ -14,6 +14,7 @@ import logging
 from typing import Dict
 
 from sdcm.utils.oci_utils import (
+    get_arch_from_oci_shape,
     get_oci_compartment_id,
     get_ubuntu_image_ocid,
 )
@@ -41,11 +42,9 @@ monitor_map = ConfigParamsMap(
     root_disk_size="root_disk_size_monitor",
 )
 
-oracle_db_map = ConfigParamsMap(
+oracle_db_map = db_map.derive(
     image_id="oci_image_db_oracle",
     type="oci_instance_type_db_oracle",
-    user_name="oci_image_username",
-    root_disk_size="root_disk_size_db",
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -94,6 +93,7 @@ class OciDefinitionBuilder(DefinitionBuilder):
                 compartment_id=get_oci_compartment_id(),
                 region=region,
                 version=ubuntu_version,
+                arch=get_arch_from_oci_shape(definition.type),
             )
 
         if "db" in node_type:

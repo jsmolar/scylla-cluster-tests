@@ -19,13 +19,18 @@ cron_triggers:
       job_folder: "scylla-master"
       labels_selector: "alternator-weekly"
       requested_by_user: "radoslawcybulski"
-  - schedule: "00 6 */14 * *"
+  # 1st and 16th of the month, 06:00 UTC — exactly 2 runs/month.
+  # NOT "*/14": day-of-month steps restart every month, so */14 fires on days
+  # 1, 15 AND 29 (3 runs/month), with the 29th only 2-3 days before the next 1st.
+  - schedule: "00 6 1,16 * *"
     params:
       scylla_version: "{branch}:latest"
       job_folder: "scylla-master"
       labels_selector: "master-2weeks"
       requested_by_user: "juliayakovlev"
-  - schedule: "0 23 */21 * *"
+  # 1st of the month, 23:00 UTC — 1 run/month.
+  # Was "*/21", which fires on days 1 and 22, i.e. 2 runs/month.
+  - schedule: "0 23 1 * *"
     params:
       scylla_version: "{branch}:latest"
       job_folder: "scylla-master"
@@ -58,6 +63,20 @@ defaults:
   billing_project: "weekly performance regression"
 
 jobs:
+  # No 2024.x or 2025.x release runs a perf regression job any more. Two things enforce it:
+  # every version filter below names all six of those branches (2024.1, 2024.2, 2025.1,
+  # 2025.2, 2025.3, 2025.4 — spelled out rather than matched by prefix, so adding a branch
+  # is a deliberate edit), and the x86 (i4i/i3en) job variants those branches were the only
+  # consumers of are retired. Their entries are kept here for reference and turned off with
+  # `disabled: true`. The weekly microbenchmarks have no version filter and still run for
+  # every branch.
+  #
+  # Vnodes coverage now lives on master only: the release entries of the i8g vnodes jobs are
+  # left in place for 2026.x and up, while the master-labelled ones keep their own schedule.
+  #
+  # Do NOT neutralize a job by emptying its `include_versions`: an empty list is *no*
+  # filter, so the job would run for every version instead of none.
+
   # === i8g vnodes (aarch64) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-i8g-vnodes"
@@ -73,12 +92,13 @@ jobs:
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-i8g-vnodes"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2025.2", "2025.1", "2024.2", "2024.1", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     job_throttle_category: "SCT-perf-eu-west-2-i8g"
     params:
       region: "eu-west-2"
       sub_tests: '["test_mixed_gradual_increase_load"]'
+      requested_by_user: "juliayakovlev"
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis-i8g-vnodes"
     backend: "aws"
@@ -93,18 +113,19 @@ jobs:
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis-i8g-vnodes"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2025.2", "2025.1", "2024.2", "2024.1", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     job_throttle_category: "SCT-perf-eu-west-1-i8g"
     params:
       region: "eu-west-1"
       sub_tests: '["test_latency_mixed_with_nemesis"]'
+      requested_by_user: "juliayakovlev"
 
-  # === x86 vnodes (non-master only) ===
+  # === x86 vnodes — retired (kept for reference) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-vnodes"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1", "2024.2", "2024.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "us-east-1"
@@ -112,13 +133,13 @@ jobs:
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-write-vnodes"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1", "2024.2", "2024.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "us-east-1"
       sub_tests: '["test_write_gradual_increase_load"]'
 
-  # === Latency with rolling upgrade (all versions) ===
+  # === Latency with rolling upgrade ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-during-rolling-upgrade"
     backend: "aws"
@@ -129,17 +150,17 @@ jobs:
       rolling_upgrade_test: "true"
       new_scylla_repo: "http://downloads.scylladb.com.s3.amazonaws.com/unstable/scylla/{branch_id}/deb/unified/latest/scylladb-{branch}/scylla.list"
 
-  # === Latency with nemesis x86 (non-master only) ===
+  # === Latency with nemesis x86 — retired (kept for reference) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1", "2024.2", "2024.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "eu-west-2"
       sub_tests: '["test_latency_mixed_with_nemesis"]'
 
-  # === Latency with nemesis rbno-disabled (all versions) ===
+  # === Latency with nemesis rbno-disabled ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis-rbno-disabled"
     backend: "aws"
@@ -157,6 +178,7 @@ jobs:
     params:
       region: "us-east-1"
       microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-simple-query-weekly-microbenchmark_arm64-write"
     backend: "aws"
@@ -165,6 +187,7 @@ jobs:
     params:
       region: "us-east-1"
       microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-simple-query-weekly-microbenchmark_x86_64"
     backend: "aws"
@@ -172,6 +195,7 @@ jobs:
     params:
       region: "us-east-1"
       microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-simple-query-weekly-microbenchmark_x86_64-write"
     backend: "aws"
@@ -179,6 +203,47 @@ jobs:
     params:
       region: "us-east-1"
       microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
+
+  # The `scylla perf-cql-raw` tool is not available in 2026.1 and will not be supported there,
+  # so these jobs are excluded from that release.
+  - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-cql-raw-weekly-microbenchmark_x86_64"
+    backend: "aws"
+    exclude_versions: ["2026.1"]
+    labels: []
+    params:
+      region: "us-east-1"
+      microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
+
+  - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-cql-raw-weekly-microbenchmark_x86_64-write"
+    backend: "aws"
+    exclude_versions: ["2026.1"]
+    labels: []
+    params:
+      region: "us-east-1"
+      microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
+
+  - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-cql-raw-weekly-microbenchmark_arm64"
+    backend: "aws"
+    arch: "aarch64"
+    exclude_versions: ["2026.1"]
+    labels: []
+    params:
+      region: "us-east-1"
+      microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
+
+  - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-cql-raw-weekly-microbenchmark_arm64-write"
+    backend: "aws"
+    arch: "aarch64"
+    exclude_versions: ["2026.1"]
+    labels: []
+    params:
+      region: "us-east-1"
+      microbenchmark: "true"
+      requested_by_user: "juliayakovlev"
 
   # === Daily sanity perf (master-only) ===
 
@@ -201,7 +266,7 @@ jobs:
 
   - job_name: "/scylla-master/perf-regression/latte-perf-regression-latency-steady-state-custom-d1-workload1-vnodes"
     backend: "gce"
-    exclude_versions: ["2024.1", "2024.2"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1"]
     pre_release: ["rc1", "rc3"]
     labels: ["gce-custom-monthly"]
     params:
@@ -210,7 +275,7 @@ jobs:
 
   - job_name: "/scylla-master/perf-regression/latte-perf-regression-latency-steady-state-custom-d1-workload1-tablets"
     backend: "gce"
-    exclude_versions: ["2024.1", "2024.2"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1"]
     pre_release: ["rc1", "rc3"]
     labels: ["gce-custom-monthly"]
     params:
@@ -232,18 +297,19 @@ jobs:
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-i8g-tablets"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2025.2", "2025.1", "2024.1", "2024.2", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     job_throttle_category: "SCT-perf-us-west-2-i8g"
     params:
       region: "us-west-2"
       sub_tests: '["test_read_gradual_increase_load", "test_mixed_gradual_increase_load", "test_write_gradual_increase_load", "test_read_disk_only_gradual_increase_load"]'
+      requested_by_user: "juliayakovlev"
 
-  # === x86 tablets (non-master only) ===
+  # === x86 tablets — retired (kept for reference) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-tablets"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "us-east-1"
@@ -251,20 +317,19 @@ jobs:
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-predefined-throughput-steps-write-tablets"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "us-east-1"
       sub_tests: '["test_write_gradual_increase_load"]'
 
-  # === Tablets latency — rolling upgrade (non-master) ===
+  # === Tablets latency, rolling upgrade x86 — retired (kept for reference) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-during-rolling-upgrade-tablets"
     backend: "aws"
-    # 2025.2 has no published unstable deb nightly artifacts on the S3 bucket yet
-    # (only build-packages/relocatable/testLogs); keep this restricted to 2025.1
-    # until nightly builds resume for 2025.2.
-    include_versions: ["2025.1"]
+    # Ran for 2025.1 only: 2025.2 never published unstable deb nightly artifacts on the S3
+    # bucket (only build-packages/relocatable/testLogs), which this job's new_scylla_repo needs.
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "eu-west-2"
@@ -272,11 +337,11 @@ jobs:
       rolling_upgrade_test: "true"
       new_scylla_repo: "http://downloads.scylladb.com.s3.amazonaws.com/unstable/scylla/{branch_id}/deb/unified/latest/scylladb-{branch}/scylla.list"
 
-  # === Tablets latency with nemesis (non-master) ===
+  # === Tablets latency with nemesis x86 — retired (kept for reference) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis-tablets"
     backend: "aws"
-    include_versions: ["2025.2", "2025.1"]
+    disabled: true  # retired with the 2024.x / 2025.x releases
     labels: []
     params:
       region: "eu-west-3"
@@ -299,7 +364,7 @@ jobs:
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-during-rolling-upgrade-i8g-tablets"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2025.2", "2025.1", "2024.2", "2024.1", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     job_throttle_category: "SCT-perf-eu-west-2-i8g"
     params:
@@ -307,6 +372,7 @@ jobs:
       sub_tests: '["test_latency_mixed_with_upgrade"]'
       rolling_upgrade_test: "true"
       new_scylla_repo: "http://downloads.scylladb.com.s3.amazonaws.com/unstable/scylla/{branch_id}/deb/unified/latest/scylladb-{branch}/scylla.list"
+      requested_by_user: "juliayakovlev"
 
   # === i8g tablets latency with nemesis (3-weekly) ===
 
@@ -323,23 +389,25 @@ jobs:
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-650gb-with-nemesis-i8g-tablets"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2025.2", "2025.1", "2024.2", "2024.1", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     job_throttle_category: "SCT-perf-eu-west-2-i8g"
     params:
       region: "eu-west-2"
       sub_tests: '["test_latency_read_with_nemesis", "test_latency_mixed_with_nemesis"]'
+      requested_by_user: "juliayakovlev"
 
   # === Elasticity (monthly) ===
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-2.5tb-i8g-elasticity"
     backend: "aws"
     arch: "aarch64"
-    exclude_versions: ["2024.1", "2024.2", "2025.1", "2025.4", "master"]
+    exclude_versions: ["2025.4", "2025.3", "2025.2", "2025.1", "2024.2", "2024.1", "master"]
     labels: []
     params:
       region: "eu-north-1"
       sub_tests: '["test_latency_mixed_with_nemesis"]'
+      requested_by_user: "juliayakovlev"
 
   - job_name: "/scylla-enterprise/perf-regression/scylla-enterprise-perf-regression-latency-2.5tb-i8g-elasticity"
     backend: "aws"

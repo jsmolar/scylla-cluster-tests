@@ -10,6 +10,11 @@ downloads), and on the GCE path GCS/Cloud Build for image export.
 Use it for provisioning-path development, artifact smoke tests, and any test whose value is in
 exercising SCT itself rather than real cloud hardware.
 
+Most production test-cases do not fit on one host as they stand. For the procedure that turns
+one into something that does - the guest-memory budget, the overlay pattern, which params each
+test type actually reads - see the
+[downscaling-for-minicloud](../skills/downscaling-for-minicloud/SKILL.md) skill.
+
 ## How activation works
 
 `is_minicloud_active()` (`sdcm/utils/minicloud/`) switches SCT into minicloud mode when any of
@@ -38,7 +43,8 @@ are separate hydra invocations that all need to reach the same live endpoint.
 test-case yaml. It is the single delivery mechanism for the params the emulator requires:
 KMS off (minicloud implements no KMS endpoint), `instance_provision: on_demand` (no spot
 market), `ip_ssh_connections: private` (guests live on the host's userspace switch),
-`force_run_iotune: false`, AZ/region fallbacks off, kernel-panic checker off, and
+`force_run_iotune: false`, placement groups and capacity reservations off (neither exists in
+minicloud's EC2 surface), AZ/region fallbacks off, kernel-panic checker off, and
 `developer_mode: true` via `append_scylla_yaml`. `preflight_check()` fails fast with the exact
 missing values when the overlay is not in the config list. Env exports cannot substitute for
 it: `SCT_*` variables set after `SCTConfiguration` is built never reach params.
@@ -114,6 +120,13 @@ exit-137 failure mode above if you were wrong.
 - **KMS** (AWS or GCP) - hence `enterprise_disable_kms: true` in the overlay. When minicloud
   grows KMS support, only the overlay changes; no pipeline knows about KMS.
 - **Spot** - `instance_provision` must stay `on_demand`.
+- **Placement groups and capacity reservations** - hence `use_placement_group: false` and
+  `use_capacity_reservation: false` in the overlay. Both are set by the performance test-cases
+  and both fail deep in provisioning rather than at startup (`GetPlacementGroupError` on a group
+  that was never created, then `CapacityReservationError`), so `validate_minicloud_params()`
+  rejects them up front instead. Tracked by
+  [QATOOLS-448](https://scylladb.atlassian.net/browse/QATOOLS-448); when it lands, only the
+  overlay changes.
 - **Local SSDs / NVMe passthrough** - guests get qcow2-backed disks.
 - Anything not in the emulated API surface fails closed with an explicit error rather than
   being silently ignored - by design, on both sides.
@@ -122,7 +135,11 @@ exit-137 failure mode above if you were wrong.
 
 Host prerequisites: KVM (`/dev/kvm` writable by your user), docker, ~80 GiB free in `$HOME` for
 the image cache, and AWS credentials for the passthrough buckets (GCP credentials additionally
-for the GCE path's image export). One-time network setup (the `minicloud0` TUN device carrying
+for the GCE path's image export). The AWS **image** path needs more than bucket access: it
+builds each guest disk over the EBS direct API, so the IAM identity also needs
+`ebs:ListSnapshotBlocks` and `ebs:GetSnapshotBlock` (the minicloud README carries a ready-made
+policy). Without them the first AWS run fails at image resolution, not at start-up.
+One-time network setup (the `minicloud0` TUN device carrying
 `10.127.0.1`) is created by the container's setup script under sudo, or pre-create it via a
 boot-time unit and no sudo is needed at run time. A networking-setup failure aborts the start -
 guests without `minicloud0` would pass API health checks and then be unreachable over SSH.
@@ -131,8 +148,13 @@ Guest IMDS traffic is DNATed through the TUN device into the host INPUT chain, a
 zone blocks it.  If that traffic is blocked, guests still boot, but never receive their SSH key,
 so login fails with `AuthenticationError`.
 
-Startup applies this automatically at runtime and re-applies it on every run, because
-`firewall-cmd --reload` clears the setting.
+`scripts/minicloud-firewalld-zone.sh` applies this at runtime and is re-run on every start,
+because `firewall-cmd --reload` clears the setting. It runs on the host rather than inside the
+hydra container: the TUN device can be created from the container (it is privileged and shares
+the host's network namespace), but firewalld is a host daemon accessed over D-Bus and
+`firewall-cmd` is not in the hydra image. `scripts/run-minicloud-test.sh` and the *Start
+Minicloud* pipeline stage both call it; a direct (non-containerised) `sct.py start-minicloud`
+does the same work in `sdcm/utils/minicloud/networking.py`.
 If you configure networking with a boot-time unit, that unit must include:
 `firewall-cmd --zone=trusted --change-interface=minicloud0`.
 
@@ -237,9 +259,10 @@ the regular `clean-resources` path.
 | container exit 143 | someone ran `docker stop minicloud` |
 | `InvalidAMIID.NotFound` on launch | AMI not cached and the container's `--aws-region` differs from where the AMI lives - or the AMI id is wrong |
 | `SnapshotNotFound` from `ListSnapshotBlocks` | dev AMI whose snapshot is not shared with the QA account - use a released version |
+| `AccessDeniedException` from `ListSnapshotBlocks`, and SCT then waits for nodes that never boot | the IAM identity has no EBS direct API permission at all - a different cause from `SnapshotNotFound` above. Grant `ebs:ListSnapshotBlocks` and `ebs:GetSnapshotBlock`. Note SCT's own log shows nothing useful here: only `minicloud.log` carries `failed to resolve image` / `background VM launch failed` |
 | "memory per shard too low" in a guest's Scylla log | `minicloud_lightweight_memory` set below ~3 GiB |
 | start aborts with "could not extract minicloud-setup.sh" or "minicloud-setup.sh failed" | host networking could not be configured - pre-create the `minicloud0` device or grant passwordless sudo |
-| guests boot and get DHCP, but SSH fails with `AuthenticationError` until the timeout | the host firewall blocks the guests' IMDS requests, so no SSH key was injected - on firewalld hosts the start moves `minicloud0` into the `trusted` zone itself; hitting this means it could not (no `firewall-cmd`-compatible firewall, or no passwordless sudo) |
+| guests boot and get DHCP, but SSH fails with `AuthenticationError` until the timeout | the host firewall blocks the guests' IMDS requests, so no SSH key was injected - on firewalld hosts `scripts/minicloud-firewalld-zone.sh` moves `minicloud0` into the `trusted` zone at every start and fails the build when it cannot, so either the script never ran - check that the *Start Minicloud* stage called it, or run it by hand on the host - or the block comes from a non-firewalld firewall (ufw, plain nftables), which the script deliberately leaves alone |
 | `clean-resources` refuses to run: "minicloud is not reachable" | the container died; collect its logs (`docker logs minicloud`) - cleanup against a fresh emulator would only pretend to succeed |
 
 The container's own log is the emulator's view of the run: `docker logs minicloud`, and
@@ -294,8 +317,9 @@ independent of minicloud; see [sct-pipelines](./sct-pipelines.md).
 A lab agent serving `minicloud-kvm-builders-v1` needs: the agent user in `kvm` and `docker`
 groups (restart the agent process after `usermod`, reconnecting is not enough); `minicloud0`
 pre-created by a boot-time unit (preferred - no sudo needed at run time) or passwordless sudo;
-on firewalld hosts, `minicloud0` in the `trusted` zone (done by the run itself given sudo, or
-by the boot-time unit - see [Running locally](#running-locally));
+on firewalld hosts, `minicloud0` in the `trusted` zone (done on the agent by
+`scripts/minicloud-firewalld-zone.sh` given passwordless sudo, or by the boot-time unit - see
+[Running locally](#running-locally));
 `USER`/`HOME` set and `$HOME` writable with >=80 GiB free; `numExecutors=1` + exclusive mode,
 which is what serialises the host singletons (port 5000, the container name, `minicloud0`);
 egress to docker.io, ghcr.io, github.com, amazonaws.com, argus.scylladb.com,

@@ -22,6 +22,7 @@ from functools import cached_property
 from typing import Any, Callable, List, Literal, TYPE_CHECKING
 
 import google.api_core.exceptions
+from google.api_core import retry as api_core_retry
 from google.api_core.client_options import ClientOptions
 from google.oauth2 import service_account
 from google.cloud import compute_v1
@@ -393,6 +394,15 @@ class GceZoneResolver:
         return {mt: self.get_zones_for_machine_type(region, mt) for mt in machine_types}
 
 
+def gce_instance_zone(instance: compute_v1.Instance) -> str:
+    """Full zone name of an instance (e.g. 'us-east1-b').
+
+    GCE reports it as a URL - "projects/<project>/zones/<zone>" - and every instance operation
+    needs the bare zone name.
+    """
+    return str(instance.zone).split("/")[-1]
+
+
 def gce_public_addresses(instance: compute_v1.Instance) -> list[str]:
     addresses = []
 
@@ -756,6 +766,51 @@ class GceLoggingClient:
         return entries
 
 
+# Transient GCE API failures: the long-running operation itself is unaffected, only the HTTP call used to
+# poll it failed, so the call is safe to repeat. Seen in the wild as
+# "503 GET .../zones/<zone>/operations/<id>: Authentication backend unavailable" during node provisioning.
+GCE_TRANSIENT_API_ERRORS = (
+    google.api_core.exceptions.TooManyRequests,  # 429
+    google.api_core.exceptions.InternalServerError,  # 500
+    google.api_core.exceptions.BadGateway,  # 502
+    google.api_core.exceptions.ServiceUnavailable,  # 503
+    google.api_core.exceptions.GatewayTimeout,  # 504
+)
+GCE_OPERATION_RETRY_INITIAL_BACKOFF = 2.0
+GCE_OPERATION_RETRY_MAX_BACKOFF = 30.0
+GCE_OPERATION_RETRY_TIMEOUT = 180.0
+# How many times a whole set_labels call (issue + poll) is replayed when it fails transiently.
+GCE_SET_LABELS_RETRIES = 3
+# A stale label fingerprint comes back as 412, which is worth replaying here too: the retry re-reads it.
+GCE_SET_LABELS_ERRORS = GCE_TRANSIENT_API_ERRORS + (google.api_core.exceptions.PreconditionFailed,)
+
+
+def gce_operation_poll_retry(
+    timeout: float | None = None, on_error: Callable[[Exception], None] | None = None
+) -> api_core_retry.Retry:
+    """Build the retry policy for the HTTP calls that poll a GCE long-running operation.
+
+    `ExtendedOperation.result()` gives up as soon as one `GET .../operations/<id>` poll returns a
+    transient error, even though the operation itself is still progressing - which aborts a whole test
+    when GCE has a short-lived hiccup. Polling is an idempotent GET, so those errors are retried with
+    exponential backoff instead.
+
+    Args:
+        timeout: the caller's operation timeout; the retry deadline is capped by it so that retrying
+            a poll cannot outlive the operation it is polling. `None` means the default deadline.
+        on_error: (optional) called with every transient error that is retried.
+    """
+    retry_timeout = GCE_OPERATION_RETRY_TIMEOUT if timeout is None else min(GCE_OPERATION_RETRY_TIMEOUT, timeout)
+    return api_core_retry.Retry(
+        predicate=api_core_retry.if_exception_type(*GCE_TRANSIENT_API_ERRORS),
+        initial=GCE_OPERATION_RETRY_INITIAL_BACKOFF,
+        maximum=GCE_OPERATION_RETRY_MAX_BACKOFF,
+        multiplier=2.0,
+        timeout=retry_timeout,
+        on_error=on_error,
+    )
+
+
 def wait_for_extended_operation(
     operation: ExtendedOperation, verbose_name: str = "operation", timeout: int = 300
 ) -> Any:
@@ -784,8 +839,36 @@ def wait_for_extended_operation(
 
         In case of an operation taking longer than `timeout` seconds to complete,
         a `concurrent.futures.TimeoutError` will be raised.
+
+        Transient GCE API errors hit while polling the operation (429, 5xx) are retried with
+        exponential backoff and do not fail the call, see `gce_operation_poll_retry()`.
     """
-    result = operation.result(timeout=timeout)
+    transient_errors: List[Exception] = []
+
+    def _on_transient_error(exc: Exception) -> None:
+        transient_errors.append(exc)
+        LOGGER.warning(
+            "Transient GCE API error while polling %s (occurrence #%s), retrying: %s",
+            verbose_name,
+            len(transient_errors),
+            exc,
+        )
+
+    try:
+        result = operation.result(timeout=timeout, retry=gce_operation_poll_retry(timeout, _on_transient_error))
+    except TimeoutError as exc:
+        # An exhausted poll retry surfaces as a plain timeout, which hides the actual GCE error - restate it.
+        if transient_errors:
+            raise TimeoutError(
+                f"{verbose_name} did not complete within {timeout} seconds: polling it hit "
+                f"{len(transient_errors)} transient GCE API error(s), the last one was: {transient_errors[-1]}"
+            ) from exc
+        raise
+
+    if transient_errors:
+        LOGGER.info(
+            "%s completed after %s transient GCE API error(s) while polling", verbose_name, len(transient_errors)
+        )
 
     if operation.error_code:
         LOGGER.debug("Error during %s: [Code: %s]: %s", verbose_name, operation.error_code, operation.error_message)
@@ -966,7 +1049,7 @@ def create_instance(  # noqa: PLR0913
         instance.scheduling.on_host_maintenance = "TERMINATE"
         instance.scheduling.provisioning_model = compute_v1.Scheduling.ProvisioningModel.SPOT.name
         instance.scheduling.instance_termination_action = instance_termination_action
-    elif machine_type.split("/")[-1].startswith("e2-"):
+    elif machine_type.rsplit("/", maxsplit=1)[-1].startswith("e2-"):
         # e2 family supports only on_host_maintenance=MIGRATE for non-spot VMs
         instance.scheduling.on_host_maintenance = "MIGRATE"
     else:
@@ -982,7 +1065,7 @@ def create_instance(  # noqa: PLR0913
         instance.advanced_machine_features = compute_v1.AdvancedMachineFeatures(
             enable_nested_virtualization=True,
         )
-        if machine_type.split("-")[0] == "n1":
+        if machine_type.split("-", maxsplit=1)[0] == "n1":
             # N1 spans pre-Haswell CPUs and nested virtualization needs Haswell or later;
             # the other families that support it at all (N2/C2/C3) are Haswell+ by definition,
             # and pinning a platform there would only narrow placement.
@@ -1039,18 +1122,45 @@ def gce_set_labels(
 
     Returns:
         Whatever the operation.result() returns.
+
+    Raises:
+        The last transient GCE API error if `GCE_SET_LABELS_RETRIES` attempts all failed, or whatever
+        `wait_for_extended_operation()` raises for a non-transient failure.
     """
+    last_error = None
+    for attempt in range(1, GCE_SET_LABELS_RETRIES + 1):
+        if attempt > 1:
+            # The label fingerprint is invalidated by any concurrent label change and by a request that
+            # reached GCE before the error did, so re-read the instance instead of replaying the old one.
+            instance = instances_client.get(project=project, zone=zone, instance=instance.name)
 
-    request = compute_v1.InstancesSetLabelsRequest()
-    request.labels = instance.labels
-    request.label_fingerprint = instance.label_fingerprint
-    request.labels.update(new_labels)
+        request = compute_v1.InstancesSetLabelsRequest()
+        request.labels = instance.labels
+        request.label_fingerprint = instance.label_fingerprint
+        request.labels.update(new_labels)
 
-    operation = instances_client.set_labels(
-        project=project, zone=zone, instance=instance.name, instances_set_labels_request_resource=request
-    )
+        try:
+            operation = instances_client.set_labels(
+                project=project, zone=zone, instance=instance.name, instances_set_labels_request_resource=request
+            )
+            return wait_for_extended_operation(operation, f"setting labels on {instance.name}")
+        except GCE_SET_LABELS_ERRORS as exc:
+            last_error = exc
+            if attempt == GCE_SET_LABELS_RETRIES:
+                break
+            backoff = min(GCE_OPERATION_RETRY_INITIAL_BACKOFF * 2 ** (attempt - 1), GCE_OPERATION_RETRY_MAX_BACKOFF)
+            LOGGER.warning(
+                "Failed to set labels on %s (attempt %s/%s), retrying in %ss: %s",
+                instance.name,
+                attempt,
+                GCE_SET_LABELS_RETRIES,
+                backoff,
+                exc,
+            )
+            time.sleep(backoff)
 
-    return wait_for_extended_operation(operation, f"setting labels on {instance.name}")
+    LOGGER.error("Failed to set labels on %s after %s attempts", instance.name, GCE_SET_LABELS_RETRIES)
+    raise last_error
 
 
 def gce_set_tags(

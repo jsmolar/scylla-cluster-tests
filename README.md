@@ -187,6 +187,7 @@ SCT_CLUSTER_BACKEND= hydra clean-resources --test-id `cat ~/sct-results/latest/t
 ## [Install local development environment](docs/install-local-env.md)
 ## [Frequently Asked Questions (FAQ)](docs/faq.md)
 ## [Contribution instructions](docs/contrib.md)
+## [HTTP retry & timeout conventions](docs/http-retry-conventions.md)
 
 ## AI code review on PRs
 
@@ -224,7 +225,7 @@ so those tests won't honor what is set in `test-cases/your_config.yaml`.
 ### Configuration Documentation
 
 - **[SCT Configuration Guide](./docs/sct-configuration.md)** - Comprehensive guide on how the configuration system works and how to add new options
-- **[Configuration Options Reference](./docs/configuration_options.md)** - Auto-generated list of all available configuration options
+- **[Configuration Options Reference](./docs/configuration_options.md)** - Auto-generated index of all configuration options, grouped by backend, test type and concern
 - **[Cross-Cloud Instance Sizing](./docs/cross-cloud-sizing.md)** - Constraint-based instance selection across AWS, GCE, Azure, and OCI
 - **[Running against minicloud](./docs/minicloud.md)** - Local QEMU/KVM cloud emulation: run SCT tests without real cloud credentials or cost
 

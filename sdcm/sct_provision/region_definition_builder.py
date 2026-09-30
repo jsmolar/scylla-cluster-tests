@@ -11,7 +11,7 @@
 #
 # Copyright (c) 2022 ScyllaDB
 import abc
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import List, Dict, Type, Any
 from pathlib import Path
@@ -30,6 +30,7 @@ from sdcm.sct_provision.user_data_objects.syslog_ng import SyslogNgUserDataObjec
 from sdcm.sct_provision.user_data_objects.vector_dev import VectorDevUserDataObject
 from sdcm.sct_provision.user_data_objects.walinuxagent import EnableWaLinuxAgent
 from sdcm.sct_provision.user_data_objects.docker_service import DockerUserDataObject
+from sdcm.sct_provision.user_data_objects.firewall import DisableFirewallUserDataObject
 from sdcm.sct_provision.user_data_objects.sct_agent import SctAgentUserDataObject
 from sdcm.test_config import TestConfig
 
@@ -60,6 +61,10 @@ class ConfigParamsMap:
     root_disk_type: str | None = None  # Maps to gce_root_disk_type_* parameters
     pd_standard_disk_size: str | None = None  # Maps to gce_pd_standard_disk_size_* parameters
     pd_ssd_disk_size: str | None = None  # Maps to gce_pd_ssd_disk_size_* parameters
+
+    def derive(self, **overrides) -> "ConfigParamsMap":
+        """Return a copy of this map with selected fields overridden."""
+        return replace(self, **overrides)
 
 
 class DefinitionBuilder(abc.ABC):
@@ -127,7 +132,7 @@ class DefinitionBuilder(abc.ABC):
         }
         user_data = self._get_user_data_objects(node_type=node_type, instance_name=name)
         mapper = self.SCT_PARAM_MAPPER[node_type]
-        use_public_ip = ssh_connection_ip_type(self.params) == "public" or node_type == "monitor"
+        use_public_ip = ssh_connection_ip_type(self.params) in ("public", "ipv6") or node_type == "monitor"
         local_ssd_count = self.params.get(mapper.local_ssd_count) if mapper.local_ssd_count else 0
         pd_standard_disk_size = self.params.get(mapper.pd_standard_disk_size) if mapper.pd_standard_disk_size else 0
         pd_ssd_disk_size = self.params.get(mapper.pd_ssd_disk_size) if mapper.pd_ssd_disk_size else 0
@@ -229,6 +234,7 @@ class DefinitionBuilder(abc.ABC):
 
     def _get_user_data_objects(self, instance_name: str, node_type: NodeTypeType) -> List[SctUserDataObject]:
         user_data_object_classes: List[Type[SctUserDataObject]] = [
+            DisableFirewallUserDataObject,
             DisableAptTriggersUserDataObject,
             SyslogNgUserDataObject,
             SyslogNgExporterUserDataObject,

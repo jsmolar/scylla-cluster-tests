@@ -68,6 +68,11 @@ from sdcm.utils.adaptive_timeouts import adaptive_timeout, Operations
 from sdcm.utils.ci_tools import get_test_name
 from sdcm.utils.common import download_from_github, shorten_cluster_name, walk_thru_data
 from sdcm.utils.docker_utils import get_docker_hub_credentials
+from sdcm.utils.grafana_api import (
+    convert_dashboard_payload_to_new_api,
+    dashboard_uid_from_payload,
+    dashboard_upsert_url,
+)
 from sdcm.utils.k8s import (
     add_pool_node_affinity,
     convert_cpu_units_to_k8s_value,
@@ -896,10 +901,10 @@ class KubernetesCluster(metaclass=abc.ABCMeta):
 
         # NOTE: Apply new image repo if provided or set default one redefining base value
         #       example structure: scylladb/scylla-operator:latest
-        values.set("image.repository", new_docker_image.split("/")[0].strip() or "scylladb")
+        values.set("image.repository", new_docker_image.split("/", maxsplit=1)[0].strip() or "scylladb")
 
         # NOTE: Set operator_image_tag even if it is empty, we need to redefine base operator image
-        values.set("image.tag", new_docker_image.split(":")[-1].strip())
+        values.set("image.tag", new_docker_image.rsplit(":", maxsplit=1)[-1].strip())
 
         # Upgrade Scylla Operator using Helm chart
         self.log.debug(
@@ -1500,7 +1505,10 @@ class KubernetesCluster(metaclass=abc.ABCMeta):
             dashboard_config["dashboard"]["title"] = dashboard_config["dashboard"]["title"].replace(
                 "$test_name", f"{get_test_name()}--{cluster_name}"
             )
-            sct_dashboard_file_data_str = json.dumps(dashboard_config)
+            dashboard_uid = dashboard_uid_from_payload(dashboard_config)
+            sct_dashboard_file_data_str = json.dumps(
+                convert_dashboard_payload_to_new_api(dashboard_config, uid=dashboard_uid)
+            )
         grafana_dn = f"{cluster_name}-grafana.{namespace}.svc.cluster.local"
         grafana_ip = self.get_grafana_ip(cluster_name=cluster_name, namespace=namespace)
         grafana_user = base64.b64decode(
@@ -1526,15 +1534,19 @@ class KubernetesCluster(metaclass=abc.ABCMeta):
             grafana_cert_obj.flush()
             sct_dashboard_obj.write(sct_dashboard_file_data_str)
             sct_dashboard_obj.flush()
+            # PUT on the named resource, so re-registering the same dashboard updates it in
+            # place instead of failing with 409 Conflict the way a POST to the collection would
             upload_result = LOCALRUNNER.run(
-                f"curl --fail -o /dev/null -w '%{{http_code}}'"
-                f" -L 'https://{grafana_dn}:{self.grafana_port}/api/dashboards/db'"
+                f"curl --fail -o /dev/null -w '%{{http_code}}' -X PUT"
+                f" -L 'https://{grafana_dn}:{self.grafana_port}"
+                f"{dashboard_upsert_url('', dashboard_uid)}'"
                 f" --resolve '{grafana_dn}:{self.grafana_port}:{grafana_ip}'"
                 f" --cacert {grafana_cert_obj.name}"
                 f" --user '{grafana_user}:{grafana_password}'"
                 f" -d @{sct_dashboard_obj.name} -H 'Content-Type: application/json'"
             ).stdout.strip()
-        if upload_result != "200":
+        # the new API answers 201 Created on first upload and 200 OK on an update
+        if not upload_result.startswith("2"):
             self.log.warning(
                 "Error uploading SCT dashboard '%s' to the grafana in the '%s' namespace: %s",
                 sct_dashboard_file,
@@ -2275,11 +2287,12 @@ class BaseScyllaPodContainer(BasePodContainer):
     def __str__(self):
         # TODO: when new network_configuration will be supported by all backends, copy this function from sdcm.cluster_aws.AWSNode.__str__
         #  to here
+        # Same as `BaseNode.__str__`: read the cached addresses only, never trigger a refresh.
         return "Node %s [%s | %s%s]%s" % (
             self.name,
-            self.public_ip_address,
-            self.private_ip_address,
-            " | %s" % self.ipv6_ip_address if self.test_config.IP_SSH_CONNECTIONS == "ipv6" else "",
+            self._public_ip_address_cached,
+            self._private_ip_address_cached,
+            " | %s" % self._ipv6_ip_address_cached if self.test_config.IP_SSH_CONNECTIONS == "ipv6" else "",
             self._dc_info_str(),
         )
 
@@ -2435,7 +2448,7 @@ class BaseScyllaPodContainer(BasePodContainer):
     def refresh_ip_address(self):
         # Invalidate ip address cache
         old_ip_info = (self.public_ip_address, self.private_ip_address)
-        self._private_ip_address_cached = self._public_ip_address_cached = self._ipv6_ip_address_cached = None
+        self.invalidate_ip_address_cache()
 
         if old_ip_info == (self.public_ip_address, self.private_ip_address):
             return
@@ -2969,8 +2982,6 @@ class ScyllaPodCluster(cluster.BaseScyllaCluster, PodCluster):
         return []
 
     def node_setup(self, node: BaseScyllaPodContainer, verbose: bool = False, timeout: int = 3600):
-        if self.test_config.BACKTRACE_DECODING:
-            node.install_scylla_debuginfo()
         self.node_config_setup()
 
     def node_startup(self, node: BaseScyllaPodContainer, verbose: bool = False, timeout: int = 3600):
@@ -2987,10 +2998,17 @@ class ScyllaPodCluster(cluster.BaseScyllaCluster, PodCluster):
         return self.k8s_clusters[0].scylla_manager_cluster.nodes[0]
 
     def get_cluster_manager(
-        self, create_if_not_exists: bool = False, force_add: bool = False, **add_cluster_extra_params
+        self,
+        create_if_not_exists: bool = False,
+        force_add: bool = False,
+        retry_listing: bool = False,
+        **add_cluster_extra_params,
     ) -> AnyManagerCluster:
         return super().get_cluster_manager(
-            create_if_not_exists=create_if_not_exists, force_add=force_add, **add_cluster_extra_params
+            create_if_not_exists=create_if_not_exists,
+            force_add=force_add,
+            retry_listing=retry_listing,
+            **add_cluster_extra_params,
         )
 
     def create_cluster_manager(self, cluster_name: str, manager_tool=None, **add_cluster_extra_params):

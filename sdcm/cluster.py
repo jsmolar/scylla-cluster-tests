@@ -68,7 +68,11 @@ from sdcm.mgmt.common import get_manager_repo, get_manager_scylla_backend
 from sdcm.prometheus import start_metrics_server, PrometheusAlertManagerListener, AlertSilencer
 from sdcm.log import SDCMAdapter
 from sdcm.provision.common.configuration_script import ConfigurationScriptBuilder
-from sdcm.provision.common.utils import configure_vector_target_script, disable_daily_apt_triggers
+from sdcm.provision.common.utils import (
+    configure_vector_target_script,
+    disable_daily_apt_triggers,
+    disable_firewall as disable_firewall_script,
+)
 from sdcm.provision.scylla_yaml import ScyllaYamlNodeAttrBuilder
 from sdcm.provision.scylla_yaml.certificate_builder import ScyllaYamlCertificateAttrBuilder
 from sdcm.provision.scylla_yaml.cluster_builder import ScyllaYamlClusterAttrBuilder
@@ -83,7 +87,11 @@ from sdcm.provision.helpers.certificate import (
     JKS_TRUSTSTORE_FILE,
     TLSAssets,
 )
-from sdcm.provision.network_configuration import ScyllaNetworkConfiguration, network_interfaces_count
+from sdcm.provision.network_configuration import (
+    NetworkInterfaceNotFound,
+    ScyllaNetworkConfiguration,
+    network_interfaces_count,
+)
 from sdcm.remote import (
     RemoteCmdRunnerBase,
     LOCALRUNNER,
@@ -112,6 +120,12 @@ from sdcm.utils.gcp_kms import GcpKms
 from sdcm.provision.gce.kms_provider import GcpKmsProvider
 from google.cloud.exceptions import GoogleCloudError
 from sdcm.utils.cql_utils import cql_quote_if_needed
+from sdcm.utils.grafana_api import (
+    DEFAULT_GRAFANA_TIMEOUT,
+    GRAFANA_ANNOTATIONS_API_PATH,
+    upload_dashboard,
+)
+from sdcm.utils.session import create_retry_session
 from sdcm.utils.benchmarks import ScyllaClusterBenchmarkManager
 from sdcm.utils.common import (
     S3Storage,
@@ -159,7 +173,7 @@ from sdcm.utils.version_utils import (
 )
 from sdcm.utils.net import get_my_ip, to_inet_ntop_format
 from sdcm.utils.node import build_node_api_command
-from sdcm.utils.nvme_diagnostics import install_nvme_cli, collect_all_smart_logs
+from sdcm.utils.nvme_diagnostics import install_nvme_cli, collect_all_smart_logs, store_baseline_smart_logs
 from sdcm.wait import wait_for_log_lines
 from sdcm.sct_events import Severity
 from sdcm.sct_events.base import LogEvent, add_severity_limit_rules, max_severity
@@ -194,6 +208,8 @@ from sdcm.utils.ldap import (
     DEFAULT_PWD_SUFFIX,
 )
 from sdcm.utils.remote_logger import get_system_logging_thread
+from sdcm.utils.minicloud.endpoint import is_minicloud_active
+from sdcm.utils.minicloud.preflight import scylla_reserve_memory
 from sdcm.utils.scylla_args import ScyllaArgParser
 from sdcm.utils.file import File
 from sdcm.utils import cdc
@@ -212,6 +228,7 @@ from sdcm.paths import (
 from sdcm.sct_provision.aws.user_data import ScyllaUserDataBuilder
 
 from sdcm.exceptions import (
+    FirewallNotDisabled,
     KillNemesis,
     NodeNotReady,
     SstablesNotFound,
@@ -233,6 +250,20 @@ HOUR_IN_SEC: int = 60 * MINUTE_IN_SEC
 MAX_TIME_WAIT_FOR_NEW_NODE_UP: int = HOUR_IN_SEC * 8
 MAX_TIME_WAIT_FOR_ALL_NODES_UP: int = MAX_TIME_WAIT_FOR_NEW_NODE_UP + HOUR_IN_SEC
 MAX_TIME_WAIT_FOR_DECOMMISSION: int = HOUR_IN_SEC * 6
+# cooldown for this build after backtrace service failure
+BACKTRACE_SERVICE_COOLDOWN_SEC: int = 15 * MINUTE_IN_SEC
+
+# Time budget for the report `wait_db_up()` collects when it gives up on a node. It runs once
+# the wait is already over, so what it delays is the caller's own failure handling.
+DB_UP_DIAGNOSTICS_BUDGET: int = 90
+
+# Dumps of the live netfilter rules, in the order they are collected. iptables-save covers the
+# nft backend the iptables wrappers use as well, `nft list ruleset` only adds the rules written
+# natively, which the wrappers do not show.
+FIREWALL_RULE_DUMP_COMMANDS = ("iptables-save", "ip6tables-save", "nft list ruleset")
+
+# how `ss` prints a listener bound to every address of the node, per address family
+CQL_WILDCARD_ADDRESSES = frozenset({"0.0.0.0", "*", "::"})
 
 LOGGER = logging.getLogger(__name__)
 
@@ -299,6 +330,10 @@ class NodeError(Exception):
             return self.msg
         else:
             return ""
+
+
+class CqlAddressUnresolvableError(Exception):
+    """raised when `cql_address` is a DNS name that the sct-runner cannot resolve"""
 
 
 class PrometheusSnapshotErrorException(Exception):
@@ -399,10 +434,20 @@ class BaseNode(AutoSshContainerMixin):
     MANAGER_AGENT_PORT = 10001
     MANAGER_SERVER_PORT = 5080
     OLD_MANAGER_PORT = 56080
+    # how long `cql_address` may stay unresolvable before it is treated as a hard failure
+    CQL_ADDRESS_RESOLVE_TIMEOUT = 120
+    CQL_ADDRESS_RESOLVE_STEP = 5
 
     log = LOGGER
     _instance_type = "N/A"
     scylla_network_configuration: Optional[ScyllaNetworkConfiguration] = None
+
+    # Class-level defaults, so that instances built by test fakes that bypass `__init__`
+    # (and any subclass that does the same) still resolve these attributes.
+    _public_ip_address_resolved = False
+    _private_ip_address_resolved = False
+    _ipv6_ip_address_resolved = False
+    destroyed = False
 
     GOSSIP_STATUSES_FILTER_OUT = [
         "LEFT",  # in case the node was decommissioned
@@ -446,6 +491,10 @@ class BaseNode(AutoSshContainerMixin):
         self._public_ip_address_cached = None
         self._private_ip_address_cached = None
         self._ipv6_ip_address_cached = None
+        self._public_ip_address_resolved = False
+        self._private_ip_address_resolved = False
+        self._ipv6_ip_address_resolved = False
+        self.destroyed = False
         self._maximum_number_of_cores_to_publish = 10
 
         self.last_line_no = 1
@@ -455,6 +504,7 @@ class BaseNode(AutoSshContainerMixin):
         self._db_log_reader_thread = None
         self._scylla_manager_journal_thread = None
         self._decoding_backtraces_thread = None
+        self._backtrace_service_cooldown: dict[str, float] = {}
 
         self._short_hostname = None
         self._alert_manager: Optional[PrometheusAlertManagerListener] = None
@@ -476,7 +526,6 @@ class BaseNode(AutoSshContainerMixin):
         self.replacement_host_id = None
 
         self._kernel_version = None
-        self._uuid = None
         self.scylla_network_configuration = None
         self._datacenter_name = None
         self._node_rack = None
@@ -557,6 +606,10 @@ class BaseNode(AutoSshContainerMixin):
     def init(self) -> None:
         if self.logdir:
             os.makedirs(self.logdir, exist_ok=True)
+        # `__str__` reads only the already-resolved addresses, so they are resolved once here:
+        # the log prefix built below is computed a single time and reused for every log record
+        # of this node.
+        self.resolve_ip_addresses()
         self.log = SDCMAdapter(self.log, extra={"prefix": str(self)})
         if self.ssh_login_info:
             self.ssh_login_info["hostname"] = self.external_address
@@ -739,6 +792,9 @@ class BaseNode(AutoSshContainerMixin):
         ssh_remoter.run(f"sudo bash -cxe {shlex.quote(script)}", verbose=True)
 
     def _init_remoter(self, ssh_login_info):
+        # A new remoter may point at a different host, so the MAC to device mapping cached from
+        # the previous one has to go.
+        self.invalidate_network_configuration_cache()
         agent_config = self.parent_cluster.params.get("agent")
         agent_enabled = agent_config.get("enabled", False) and self.parent_cluster.node_type in (
             "scylla-db",
@@ -891,7 +947,7 @@ class BaseNode(AutoSshContainerMixin):
 
     def refresh_ip_address(self):
         # Invalidate ip address cache
-        self._private_ip_address_cached = self._public_ip_address_cached = self._ipv6_ip_address_cached = None
+        self.invalidate_ip_address_cache()
         self.__dict__.pop("cql_address", None)
         self.__dict__.pop("public_dns_name", None)
         self.__dict__.pop("private_dns_name", None)
@@ -1266,9 +1322,13 @@ class BaseNode(AutoSshContainerMixin):
 
     @property
     def public_ip_address(self) -> Optional[str]:
-        # Primary network interface public IP
-        if self._public_ip_address_cached is None:
+        # Primary network interface public IP.
+        # A `None` result is cached as well: nodes provisioned without a public IP
+        # (`ip_ssh_connections: private`) would otherwise re-run the whole instance-state
+        # refresh - a cloud API call plus an `ip -j link` over SSH - on every single access.
+        if not self._public_ip_address_resolved:
             self._public_ip_address_cached = self._get_public_ip_address()
+            self._public_ip_address_resolved = True
         return self._public_ip_address_cached
 
     @property
@@ -1290,8 +1350,9 @@ class BaseNode(AutoSshContainerMixin):
     @property
     def private_ip_address(self) -> Optional[str]:
         # Primary network interface private IP
-        if self._private_ip_address_cached is None:
+        if not self._private_ip_address_resolved:
             self._private_ip_address_cached = to_inet_ntop_format(self._get_private_ip_address())
+            self._private_ip_address_resolved = True
         return self._private_ip_address_cached
 
     def _get_private_ip_address(self) -> Optional[str]:
@@ -1304,15 +1365,59 @@ class BaseNode(AutoSshContainerMixin):
     @property
     def ipv6_ip_address(self) -> Optional[str]:
         # Primary network interface public IPv6
-        if self._ipv6_ip_address_cached is None:
+        if not self._ipv6_ip_address_resolved:
             self._ipv6_ip_address_cached = to_inet_ntop_format(self._get_ipv6_ip_address())
+            self._ipv6_ip_address_resolved = True
         return self._ipv6_ip_address_cached
 
     def _get_ipv6_ip_address(self) -> Optional[str]:
-        raise NotImplementedError()
+        if self.scylla_network_configuration:
+            return self.scylla_network_configuration.interface_ipv6_address
+        return None
 
     def get_all_ip_addresses(self):
-        return [ip for ip in (self.private_ip_address, self.public_ip_address, self.ipv6_ip_address) if ip]
+        ips = [ip for ip in (self.private_ip_address, self.public_ip_address, self.ipv6_ip_address) if ip]
+        if self.scylla_network_configuration:
+            for address_getter in (
+                lambda: self.scylla_network_configuration.rpc_address,
+                lambda: self.scylla_network_configuration.broadcast_rpc_address,
+            ):
+                try:
+                    extra_address = address_getter()
+                except NetworkInterfaceNotFound, AttributeError:
+                    continue
+                if not extra_address or extra_address == ScyllaNetworkConfiguration.LISTEN_ALL:
+                    continue
+                try:
+                    ipaddress.ip_address(extra_address)
+                except ValueError:
+                    continue
+                if extra_address not in ips:
+                    ips.append(extra_address)
+        return ips
+
+    def invalidate_ip_address_cache(self) -> None:
+        """Drop the cached addresses so that the next access resolves them again."""
+        self._private_ip_address_cached = self._public_ip_address_cached = self._ipv6_ip_address_cached = None
+        self._private_ip_address_resolved = self._public_ip_address_resolved = self._ipv6_ip_address_resolved = False
+
+    def resolve_ip_addresses(self) -> None:
+        """Populate the address cache, so that `__str__` has something to print.
+
+        `__str__` never resolves addresses on its own (it would run cloud API calls and SSH
+        commands from inside a log record), so the addresses are resolved here instead, while
+        the node is known to be reachable.
+        """
+        for ip_address_property in ("private_ip_address", "public_ip_address"):
+            try:
+                getattr(self, ip_address_property)
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("Node %s: failed to resolve %s: %s", self.name, ip_address_property, exc)
+        if self.test_config.IP_SSH_CONNECTIONS == "ipv6":
+            try:
+                self.ipv6_ip_address
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("Node %s: failed to resolve ipv6_ip_address: %s", self.name, exc)
 
     def _wait_public_ip(self):
         public_ips, _ = self._refresh_instance_state()
@@ -1330,7 +1435,7 @@ class BaseNode(AutoSshContainerMixin):
     def network_configuration(self) -> dict[str, str]:
         """Query the MAC address to device name mapping from the node."""
         remoter = self.remoter
-        if not remoter:
+        if not remoter or self.destroyed:
             return {}
 
         network_devices = {}
@@ -1350,10 +1455,16 @@ class BaseNode(AutoSshContainerMixin):
         self.log.debug("Node %s ethernets: %s", self.name, network_devices)
         return network_devices
 
-    def refresh_network_interfaces_info(self):
-        # rebuild cached network mapping from the current remoter/node
+    def invalidate_network_configuration_cache(self) -> None:
+        """Drop the cached MAC address to device name mapping.
+
+        The mapping is a property of the node itself, so it only goes stale when the remoter is
+        replaced (see `_init_remoter`) - it must not be dropped on every instance-state refresh,
+        which would re-run `ip -j link` over SSH for each access (scylladb/scylla-cluster-tests#10217).
+        """
         self.__dict__.pop("network_configuration", None)
 
+    def refresh_network_interfaces_info(self):
         if self.scylla_network_configuration:
             self.scylla_network_configuration.network_interfaces = self.network_interfaces
 
@@ -1518,6 +1629,9 @@ class BaseNode(AutoSshContainerMixin):
         return AlertSilencer(self._alert_manager, alert_name, duration, start, end)
 
     def _dc_info_str(self):
+        # Called from `__str__` only, so it must stay I/O free: the cached values are read
+        # directly instead of the `datacenter`/`node_rack` properties, which run `nodetool`
+        # on the node when their cache is empty.
         dc_info = []
 
         # Example: `ManagerPodCluser` - the `params` is not needed and may be not passed there. Manager always created in the first DC
@@ -1538,18 +1652,22 @@ class BaseNode(AutoSshContainerMixin):
                 severity=Severity.ERROR,
             ).publish()
 
-        elif len(self.parent_cluster.params.region_names) > 1 and self.datacenter:
-            dc_info.append(f"dc name: {self.datacenter}")
+        elif len(self.parent_cluster.params.region_names) > 1 and self._datacenter_name:
+            dc_info.append(f"dc name: {self._datacenter_name}")
 
         # Workaround for 'k8s-local-kind*' backend.
         # "node.init()" is called in `sdcm.cluster_k8s.mini_k8s.LocalMinimalClusterBase.host_node` when Scylla cluster, that hold
         # "racks_count" parameter, is not created yet
-        if hasattr(self.parent_cluster, "racks_count") and self.parent_cluster.racks_count > 1 and self.node_rack:
-            dc_info.append(f"rack: {self.node_rack}")
+        if hasattr(self.parent_cluster, "racks_count") and self.parent_cluster.racks_count > 1 and self._node_rack:
+            dc_info.append(f"rack: {self._node_rack}")
 
         return f" ({', '.join(dc_info)})" if dc_info else ""
 
     def __str__(self):
+        # `__str__` is called from log records and event messages, so it must never perform
+        # cloud API calls or run commands over SSH: a node that is unreachable (terminated by
+        # a nemesis, for example) would make every log line that mentions it block for minutes
+        # and emit spurious errors. Only already-resolved addresses are used here.
         # If multiple network interface is defined on the node (AWS), private address in the `nodetool status`
         # is IP that defined in broadcast_address. Keep this output in correlation with `nodetool status`
         if (
@@ -1558,13 +1676,13 @@ class BaseNode(AutoSshContainerMixin):
         ):
             node_private_ip = self.scylla_network_configuration.broadcast_address
         else:
-            node_private_ip = self.private_ip_address
+            node_private_ip = self._private_ip_address_cached
 
         return "Node %s [%s | %s%s] (Type: %s)%s" % (
             self.name,
-            self.public_ip_address,
+            self._public_ip_address_cached,
             node_private_ip,
-            " | %s" % self.ipv6_ip_address if self.test_config.IP_SSH_CONNECTIONS == "ipv6" else "",
+            " | %s" % self._ipv6_ip_address_cached if self.test_config.IP_SSH_CONNECTIONS == "ipv6" else "",
             self._instance_type,
             self._dc_info_str(),
         )
@@ -1782,6 +1900,12 @@ class BaseNode(AutoSshContainerMixin):
         self.stop_task_threads()
         if self.remoter:
             self.remoter.stop()
+            # The instance is gone, so drop the remoter as well: it is kept reachable through
+            # `cluster.dead_nodes_list` and `nemesis.target_node`, and any later attempt to run
+            # a command on it would block until the SSH connect timeout expires, several times
+            # over, for every access.
+            self.remoter = None
+        self.destroyed = True
         ContainerManager.destroy_all_containers(self)
         self._terminate_node_in_argus()
         LOGGER.info("%s destroyed", self)
@@ -1806,6 +1930,17 @@ class BaseNode(AutoSshContainerMixin):
         try:
             socket.create_connection((self.cql_address, port)).close()
             return True
+        except socket.gaierror as details:
+            # gaierror is an OSError, so without this branch an unresolvable `cql_address` is
+            # indistinguishable from "the port is not open yet" and the caller just times out
+            self.log.error(
+                "Cannot resolve '%s' while checking for '%s' on port %s: %s",
+                self.cql_address,
+                service_name,
+                port,
+                details,
+            )
+            return False
         except OSError:
             return False
         except Exception as details:  # noqa: BLE001
@@ -1927,40 +2062,132 @@ class BaseNode(AutoSshContainerMixin):
             text = "%s: Waiting for JMX service to be down" % self.name
         wait.wait_for(func=lambda: not self.jmx_up(), step=60, text=text, timeout=timeout, throw_exc=True)
 
-    @property
-    def uuid(self):
-        if not self._uuid and not self.is_nonroot_install:
-            uuid_path = "/var/lib/scylla-housekeeping/housekeeping.uuid"
-            uuid_result = self.remoter.run("test -e %s" % uuid_path, ignore_status=True, verbose=True)
-            uuid_exists = uuid_result.ok
-            if uuid_exists:
-                result = self.remoter.run("cat %s" % uuid_path, verbose=True)
-                self._uuid = result.stdout.strip()
-        return self._uuid
+    def verify_cql_address_resolvable(self, timeout: int = CQL_ADDRESS_RESOLVE_TIMEOUT) -> None:
+        """Fail fast when `cql_address` is a DNS name the sct-runner cannot resolve.
 
-    def _report_housekeeping_uuid(self):
+        With `use_dns_names`, `cql_address` is the node's cloud-internal DNS name. A name that
+        does not resolve never starts resolving on its own, yet every CQL probe then fails with
+        `socket.gaierror` - an `OSError`, so it looks exactly like "the port is not open yet"
+        and the caller burns its whole timeout in silence. Resolving once up front turns that
+        into an immediate, named failure.
         """
-        report uuid of test db nodes to ScyllaDB
-        """
-        mark_path = "/var/lib/scylla-housekeeping/housekeeping.uuid.marked"
-        cmd = 'curl "https://i6a5h9l1kl.execute-api.us-east-1.amazonaws.com/prod/check_version?uu=%s&mark=scylla"'
-        try:
-            mark_exists = self.remoter.run("test -e %s" % mark_path, ignore_status=True, verbose=False).ok
-            if self.uuid and not mark_exists:
-                self.remoter.run(cmd % self.uuid, ignore_status=True)
-                self.remoter.sudo("touch %s" % mark_path, verbose=False, user="scylla")
-        except Exception as details:  # noqa: BLE001
-            self.log.error("Failed to report housekeeping uuid. Error details: %s", details)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                socket.getaddrinfo(self.cql_address, self.CQL_PORT, proto=socket.IPPROTO_TCP)
+                return
+            except socket.gaierror as details:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise CqlAddressUnresolvableError(
+                        f"{self.name}: cql_address '{self.cql_address}' did not resolve within {timeout}s: {details}. "
+                        f"On AWS this happens when the cluster was relocated to a region other than the "
+                        f"sct-runner's, because EC2 private DNS names do not resolve from another region's VPC."
+                    ) from details
+                # never sleep past the caller's deadline - `timeout` is an upper bound, not a hint
+                time.sleep(min(self.CQL_ADDRESS_RESOLVE_STEP, remaining))
 
     def wait_db_up(self, verbose=True, timeout=3600):
+        """Wait until the node answers on its CQL port, reporting a node which never did.
+
+        Args:
+            verbose: log a line on every poll saying which node is being waited for.
+            timeout: seconds to keep polling before raising. A falsey timeout polls forever,
+                and so never reports anything - there is no giving up to report on.
+
+        Raises:
+            WaitForTimeoutError: the port did not open within `timeout`. Why it stayed
+                unreachable is reported first, see `log_cql_unreachable_diagnostics()`.
+            ExitByEventError: the wait was stopped through `stop_wait_db_up_event`. Nothing
+                is reported, the wait was cut short on purpose and the node is not at fault.
+        """
         text = None
         if verbose:
             text = "%s: Waiting for DB services to be up" % self.name
 
-        wait.wait_for(
-            func=self.db_up, step=5, text=text, timeout=timeout, throw_exc=True, stop_event=self.stop_wait_db_up_event
-        )
-        threading.Thread(target=self._report_housekeeping_uuid, daemon=True).start()
+        self.verify_cql_address_resolvable(timeout=min(self.CQL_ADDRESS_RESOLVE_TIMEOUT, timeout))
+        try:
+            wait.wait_for(
+                func=self.db_up,
+                step=5,
+                text=text,
+                timeout=timeout,
+                throw_exc=True,
+                stop_event=self.stop_wait_db_up_event,
+            )
+        except WaitForTimeoutError:
+            # the node is still up at this point, and about to be torn down or replaced by
+            # whoever was waiting for it: last chance to tell a node which is up but
+            # unreachable from one which never started (SCT-479)
+            self.log_cql_unreachable_diagnostics()
+            raise
+
+    def log_cql_unreachable_diagnostics(self) -> None:
+        """Report why the CQL port stayed unreachable for the whole of `wait_db_up()`.
+
+        A node which serves CQL locally but is unreachable from SCT looks exactly like a node
+        which never started: both keep `db_up()` returning False until the timeout expires,
+        an hour later (SCT-479). Tell the two apart while the node is still there to look at.
+
+        Best-effort by design: a node which cannot be reached over SSH either leaves the wait
+        to fail with nothing said about it, exactly as it did before.
+        """
+        command_timeout = DB_UP_DIAGNOSTICS_BUDGET // 3
+        try:
+            listening = self.remoter.run("ss -ltn", ignore_status=True, verbose=False, timeout=command_timeout)
+            bound_to = self.cql_listening_addresses(listening.stdout) if listening.ok else set()
+            if not bound_to:
+                self.log.debug("Node %s does not listen on the CQL port yet", self.name)
+                return
+            # a listener on an address SCT does not connect to is a local bind problem, and
+            # blaming the network for it sends whoever reads this down the wrong path
+            if not bound_to & (CQL_WILDCARD_ADDRESSES | {self.cql_address}):
+                message = (
+                    f"Node {self.name} listens on the CQL port at {', '.join(sorted(bound_to))}, and not on "
+                    f"{self.cql_address} which SCT connects to - Scylla bound CQL to the wrong address."
+                )
+                self.log.warning(message)
+                InfoEvent(message=message, severity=Severity.WARNING).publish()
+                return
+            message = (
+                f"Node {self.name} listens on the CQL port locally, but {self.cql_address}:{self.CQL_PORT} "
+                f"is not reachable from SCT. The node itself is up, so the traffic to it is being dropped "
+                f"on the way - its netfilter rules and routing state are in the node log."
+            )
+            self.log.warning(message)
+            self.log.warning("netfilter rules on %s:\n%s", self.name, self.get_firewall_rules())
+            network_state = self.remoter.run(
+                "ip -d addr; ip route; ip -6 route; ip rule; ip -6 rule; ip neigh; ip -6 neigh",
+                ignore_status=True,
+                verbose=False,
+                timeout=command_timeout,
+            )
+            self.log.warning("network state of %s:\n%s", self.name, network_state.stdout)
+            # WARNING, not ERROR: this only says why the wait failed, the failure itself gets
+            # its own event from whoever was waiting for the node
+            InfoEvent(message=message, severity=Severity.WARNING).publish()
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("Failed to collect the diagnostics of the unreachable node %s: %s", self.name, exc)
+
+    def cql_listening_addresses(self, ss_output: str) -> set[str]:
+        """The addresses the CQL port is bound to, read from the output of `ss -ltn`.
+
+        Args:
+            ss_output: the listening sockets of the node, as `ss -ltn` prints them.
+
+        Returns:
+            The local addresses of the listeners on the CQL port, with the wildcards
+            (`0.0.0.0`, `*`, `::`) kept as they are. Empty when nothing listens on it.
+        """
+        addresses = set()
+        for line in ss_output.splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            address, _, port = fields[3].rpartition(":")
+            if port == str(self.CQL_PORT):
+                addresses.add(address.strip("[]"))
+        return addresses
 
     def is_manager_agent_up(self, port=None):
         port = port if port else self.MANAGER_AGENT_PORT
@@ -2119,16 +2346,23 @@ class BaseNode(AutoSshContainerMixin):
 
     def start_decode_on_monitor_node_thread(self):
         self._decoding_backtraces_thread = threading.Thread(
-            target=self.decode_backtrace, name="DecodeOnMonitorNodeThread", daemon=True
+            target=self.decode_backtrace, name="DecodeBacktraceThread", daemon=True
         )
         self._decoding_backtraces_thread.daemon = True
         self._decoding_backtraces_thread.start()
 
     @lru_cache(maxsize=None)
+    @retrying(
+        n=3,
+        sleep_time=5,
+        allowed_exceptions=(requests.RequestException,),
+        message="Decoding backtrace via backtrace.scylladb.com",
+    )
     def _decode_via_external_service(self, build_id: str, raw_backtrace: str) -> str:
         """Decode backtrace using the external backtraces.scylladb.com service.
 
-        Avoids loading 1+ GB DWARF debug info on the monitor node (prevents OOM).
+        Transient HTTP/network errors (404, 5xx, timeouts, connection errors) are retried;
+        a reply with success=false is a processing error on the service side and is final.
 
         Args:
             build_id: hex build ID of the scylla binary
@@ -2138,7 +2372,7 @@ class BaseNode(AutoSshContainerMixin):
             decoded backtrace string (stdout from the service)
 
         Raises:
-            requests.RequestException: on network/HTTP error
+            requests.RequestException: on network/HTTP error after all retries
             ValueError: if the service returns success=false
         """
         response = requests.post(
@@ -2161,42 +2395,10 @@ class BaseNode(AutoSshContainerMixin):
                     break
                 event = obj["event"]
                 self.log.debug("Event origin severity: %s", event.severity)
-                build_id = obj["build_id"]
-                raw_backtrace_oneline = " ".join(event.raw_backtrace.split("\n"))
-
-                decoded = None
-                if build_id:
-                    try:
-                        decoded = self._decode_via_external_service(build_id, event.raw_backtrace)
-                        self.log.debug("Decoded backtrace via external service for build_id=%s", build_id)
-                    except Exception as exc:  # noqa: BLE001
-                        self.log.warning("External backtrace service failed (%s), falling back to local addr2line", exc)
-
-                if decoded is None:
-                    scylla_debug_file = self.copy_scylla_debug_info(obj["node"], build_id)
-                    decoded = self.decode_backtrace_local(scylla_debug_file, raw_backtrace_oneline).stdout
-
-                event.backtrace = decoded
-                the_map = FindIssuePerBacktrace()
-                if issue_url := the_map.find_issue(backtrace_type=event.type, decoded_backtrace=event.backtrace):
-                    event.known_issue = issue_url
-                    skip_per_issue = SkipPerIssues(issue_url, self.parent_cluster.params)
-                    # If found issue is closed
-                    if not skip_per_issue.issues_opened():
-                        if skip_per_issue.issues_labeled():
-                            # If found issue has skip label, this issue was fixed but won't be backported to the tested branch.
-                            # So this reactor stall is expected and shouldn't fail the test
-                            # if this event severity is Error or Critical - decrease to warning.
-                            event.severity = (
-                                Severity.WARNING if event.severity.value > Severity.WARNING.value else event.severity
-                            )
-                        else:
-                            # If found issue has no skip label - increase severity to Error (if not).
-                            # A reason: the issue was fixed, and it is not expected to get this reactor stall
-                            event.severity = (
-                                Severity.ERROR if event.severity.value < Severity.ERROR.value else event.severity
-                            )
-                    self.log.debug("Found issue for %s event: %s", event.event_id, event.known_issue)
+                event.build_id = obj["build_id"]
+                if decoded := self._decode_backtrace_via_service(event.build_id, event.raw_backtrace):
+                    event.backtrace = decoded
+                    self._match_known_issue(event)
             except queue.Empty:
                 pass
             except Exception as details:  # noqa: BLE001
@@ -2211,73 +2413,52 @@ class BaseNode(AutoSshContainerMixin):
             if self.termination_event.is_set() and self.test_config.DECODING_QUEUE.empty():
                 break
 
-    def copy_scylla_debug_info(self, node_name: str, build_id: str):
-        """Copy scylla debug file from db-node to monitor-node.
+    def _decode_backtrace_via_service(self, build_id: Optional[str], raw_backtrace: str) -> Optional[str]:
+        """Decode a backtrace with backtrace.scylladb.com, or return None to publish it undecoded.
 
-        Skip if debug file already exists on monitor node.
-
-        Copy via builder
-        :param node_name: db node name
-        :type node_name: str
-        :param build_id: build id of scylla binary
-        :type build_id: str
-        :returns: path on monitor node
-        :rtype: {str}
+        Backtraces are never decoded locally. An undecoded backtrace can still be decoded later from
+        the build id and the raw addresses.
         """
-        final_scylla_debug_file = os.path.join("/tmp", f"debug_{build_id}")
-        res = self.remoter.run(f"test -f {final_scylla_debug_file}", ignore_status=True, verbose=False)
-        if res.exited == 0:
-            return final_scylla_debug_file
-        db_nodes = self.parent_cluster.targets["db_cluster"].nodes
-        db_node = next(iter([n for n in db_nodes if n.name == node_name]), None)
-        assert db_node, f"Node named: {node_name} wasn't found"
+        if not build_id:
+            self.log.warning("No build-id known for this backtrace, publishing it undecoded")
+            return None
 
-        debug_file = db_node.get_scylla_debuginfo_file(build_id)
-        LOGGER.debug("Debug info file %s", debug_file)
-        base_scylla_debug_file = os.path.basename(debug_file)
-        transit_scylla_debug_file = os.path.join(db_node.parent_cluster.logdir, base_scylla_debug_file)
-        db_node.remoter.receive_files(debug_file, transit_scylla_debug_file)
-        self.remoter.send_files(transit_scylla_debug_file, final_scylla_debug_file)
-        self.log.info("File on monitor node %s: %s", self, final_scylla_debug_file)
-        self.log.info("Remove transit file: %s", transit_scylla_debug_file)
-        os.remove(transit_scylla_debug_file)
-        return final_scylla_debug_file
+        if time.monotonic() < self._backtrace_service_cooldown.get(build_id, 0):
+            self.log.debug("Backtrace service is in cooldown for build_id=%s, publishing raw backtrace", build_id)
+            return None
 
-    def get_scylla_debuginfo_file(self, build_id: str):
-        """Lookup the scylla debug information for a given build_id."""
-        # first try default location
-        scylla_debug_info = "/usr/lib/debug/bin/scylla.debug"
-        results = self.remoter.run(f"[[ -f {scylla_debug_info} ]]", ignore_status=True)
-        if results.ok:
-            return scylla_debug_info
+        try:
+            decoded = self._decode_via_external_service(build_id, raw_backtrace)
+        except Exception as exc:  # noqa: BLE001
+            self._backtrace_service_cooldown[build_id] = time.monotonic() + BACKTRACE_SERVICE_COOLDOWN_SEC
+            self.log.warning(
+                "External backtrace service failed for build_id=%s (%s); publishing the raw backtrace, "
+                "it can be decoded later. Not asking the service about this build for the next %d min",
+                build_id,
+                exc,
+                BACKTRACE_SERVICE_COOLDOWN_SEC // MINUTE_IN_SEC,
+            )
+            return None
+        self.log.debug("Decoded backtrace via external service for build_id=%s", build_id)
+        return decoded
 
-        # then try the relocatable location
-        results = self.remoter.run("ls /usr/lib/debug/opt/scylladb/libexec/scylla*.debug", ignore_status=True)
-        if results.stdout.strip():
-            return results.stdout.strip()
+    def _match_known_issue(self, event) -> None:
+        """Look the decoded backtrace up in the known-issues map and adjust the event severity."""
+        issue_url = FindIssuePerBacktrace().find_issue(backtrace_type=event.type, decoded_backtrace=event.backtrace)
+        if not issue_url:
+            return
 
-        # then look it up based on the build id
-        if build_id:
-            scylla_debug_info = f"/usr/lib/debug/.build-id/{build_id[:2]}/{build_id[2:]}.debug"
-            results = self.remoter.run(f"[[ -f {scylla_debug_info} ]]", ignore_status=True)
-            if results.ok:
-                return scylla_debug_info
+        event.known_issue = issue_url
+        skip_per_issue = SkipPerIssues(issue_url, self.parent_cluster.params)
 
-        raise Exception("Couldn't find scylla debug information")
+        if not skip_per_issue.issues_opened():
+            if skip_per_issue.issues_labeled():
+                if event.severity.value > Severity.WARNING.value:
+                    event.severity = Severity.WARNING
+            elif event.severity.value < Severity.ERROR.value:
+                event.severity = Severity.ERROR
 
-    @lru_cache(maxsize=None)
-    def decode_backtrace_local(self, scylla_debug_file, raw_backtrace):
-        """run decode backtrace on monitor node
-
-        Decode backtrace on monitor node
-        :param scylla_debug_file: file path on db-node
-        :type scylla_debug_file: str
-        :param raw_backtrace: string with backtrace data
-        :type raw_backtrace: str
-        :returns: result of bactrace
-        :rtype: {str}
-        """
-        return self.remoter.run(f"addr2line -Cpife {scylla_debug_file} {raw_backtrace}", verbose=True)
+        self.log.debug("Found issue for %s event: %s", event.event_id, event.known_issue)
 
     def get_scylla_build_id(self) -> Optional[str]:
         for scylla_executable in (
@@ -2649,6 +2830,29 @@ class BaseNode(AutoSshContainerMixin):
             self.remoter.sudo(update_cmd, ignore_status=ignore_status)
         self.remoter.sudo(install_cmd, ignore_status=ignore_status)
 
+    def remove_package(self, package_name: str, ignore_status: bool = True) -> None:
+        """Uninstall a package, tolerating it not being installed at all."""
+        if self.distro.is_rhel_like:
+            pkg_mgr = next(
+                (
+                    mgr
+                    for mgr in ["microdnf", "yum", "dnf"]
+                    if self.remoter.run(f"test -e /usr/bin/{mgr}", ignore_status=True).ok
+                ),
+                None,
+            )
+            if not pkg_mgr:
+                raise NodeSetupFailed(
+                    node=self,
+                    error_msg="No supported RPM package manager found (expected one of: microdnf, yum, dnf)",
+                )
+            remove_cmd = rpm_cmd(pkg_mgr, f"remove -y {package_name}")
+        elif self.distro.is_sles:
+            remove_cmd = f"zypper remove -y {package_name}"
+        else:
+            remove_cmd = apt_cmd(f"remove -y {package_name}")
+        self.remoter.sudo(remove_cmd, ignore_status=ignore_status)
+
     def install_manager_agent(self, package_path: Optional[str] = None) -> None:
         package_name = "scylla-manager-agent"
         package_version = None
@@ -2712,7 +2916,7 @@ class BaseNode(AutoSshContainerMixin):
             self.remoter.sudo("zypper update scylla-manager-agent -y")
         else:
             self.remoter.sudo(apt_cmd("update"), ignore_status=True)
-            self.remoter.sudo(apt_cmd("install -y scylla-manager-agent", options={"DPkg::Lock::Timeout": "300"}))
+            self.remoter.sudo(apt_cmd("install -y scylla-manager-agent"))
         self.remoter.sudo("scyllamgr_agent_setup -y")
         if start_agent_after_upgrade:
             if self.is_docker():
@@ -2752,23 +2956,26 @@ class BaseNode(AutoSshContainerMixin):
         self.clean_scylla_data()
 
     def update_repo_cache(self):
+        """Clean the package manager cache and refresh the repo metadata."""
         try:
             if self.distro.is_rhel_like:
                 # The yum makecache command was removed from here since not needed and recommended.
                 # In the past it also caused ERROR 404 of yum, reference https://wiki.centos.org/yum-errors
                 # This fixes https://github.com/scylladb/scylla-cluster-tests/issues/4977
-                self.remoter.sudo("yum clean all")
+                self.remoter.sudo(rpm_cmd("yum", "clean all"), retry=3)
                 self.remoter.sudo("rm -rf /var/cache/yum/")
             elif self.distro.is_sles:
-                self.remoter.sudo("zypper clean all")
+                self.remoter.sudo("zypper clean all", retry=3)
                 self.remoter.sudo("rm -rf /var/cache/zypp/")
                 self.remoter.sudo("zypper refresh", retry=3)
             else:
-                self.remoter.sudo("apt-get clean all")
+                # NOTE: it is `apt-get clean`, not `apt-get clean all`: unlike yum, apt-get clean
+                #       takes no arguments
+                self.remoter.sudo(apt_cmd("clean", dpkg_options=False, lock_wait=True), retry=3)
                 self.remoter.sudo("rm -rf /var/cache/apt/")
-                self.remoter.sudo(apt_cmd("update"), retry=3)
-        except Exception as ex:  # noqa: BLE001
-            self.log.error("Failed to update repo cache: %s", ex)
+                self.remoter.sudo(apt_cmd("update", lock_wait=True), retry=3)
+        except Exception as ex:
+            raise NodeSetupFailed(node=self, error_msg=f"Failed to update repo cache: {ex}") from ex
 
     def upgrade_system(self):
         if self.distro.is_rhel_like:
@@ -2874,7 +3081,7 @@ class BaseNode(AutoSshContainerMixin):
         """)
         result = self.remoter.run('bash -cxe "%s"' % package_version_cmds_v3, ignore_status=True)
         if not result.ok:
-            logging.info("v3 version of .relocatable_package_version does not detected, retry with v2 version")
+            LOGGER.info("v3 version of .relocatable_package_version does not detected, retry with v2 version")
             result = self.remoter.run('bash -cxe "%s"' % package_version_cmds_v2)
         package_version = packaging.version.parse(result.stdout.strip())
 
@@ -2909,14 +3116,14 @@ class BaseNode(AutoSshContainerMixin):
             if package_version < packaging.version.parse("3"):
                 install_cmds = dedent("""
                     tar xvfz ./unified_package.tar.gz
-                    ./install.sh --housekeeping
+                    ./install.sh
                     rm -f /tmp/scylla.yaml
                 """)
             else:
                 install_cmds = dedent("""
                     tar xvfz ./unified_package.tar.gz
                     cd ./scylla-*
-                    ./install.sh --housekeeping
+                    ./install.sh
                     cd -
                     rm -f /tmp/scylla.yaml
                 """)
@@ -2936,23 +3143,6 @@ class BaseNode(AutoSshContainerMixin):
             f"| sudo bash -s -- --scylla-version {version}",
             retry=3,
         )
-
-    def install_scylla_debuginfo(self) -> None:
-        if ComparableScyllaVersion(self.scylla_version) > "2025.1.0~dev":
-            # since source available versions, theres only on option for package names
-            package_prefix = "scylla"
-        else:
-            package_prefix = self.scylla_pkg()
-
-        if self.distro.is_rhel_like or self.distro.is_sles:
-            package_name = rf"{package_prefix}-debuginfo-{self.scylla_version}\*"
-        else:
-            package_name = rf"{package_prefix}-server-dbg={self.scylla_version}\*"
-
-        self.log.debug("Installing Scylla debug info...")
-        # using ignore_status=True cause of docker image doesn't have the repo/list available
-        # TODO: find a why to identify the package, otherwise we don't have debug symbols
-        self.install_package(package_name=package_name, ignore_status=True)
 
     def is_scylla_installed(self, raise_if_not_installed=False):
         if self.get_scylla_binary_version():
@@ -3412,10 +3602,12 @@ class BaseNode(AutoSshContainerMixin):
                 )
                 collect_diagnostic_data(self)
                 wait.wait_for(
-                    func=lambda: self._service_cmd(
-                        service_name="scylla-server", cmd="is-active", timeout=timeout, ignore_status=True
-                    ).stdout.strip()
-                    == "inactive",
+                    func=lambda: (
+                        self._service_cmd(
+                            service_name="scylla-server", cmd="is-active", timeout=timeout, ignore_status=True
+                        ).stdout.strip()
+                        == "inactive"
+                    ),
                     step=60,
                     text="still waiting for scylla-server to stop",
                     timeout=900,
@@ -3881,6 +4073,9 @@ class BaseNode(AutoSshContainerMixin):
             hostname=self.name,
             log_file=log_file,
             test_config=self.test_config,
+            # NOTE: no 'disable_guest_firewall' here on purpose - this one re-runs on a live node
+            #       to re-point the logs, long after boot, and flushing the tables there would
+            #       take the rules of a running network nemesis with it
         ).to_string()
         self.remoter.sudo(shell_script_cmd(script, quote="'"))
 
@@ -4120,20 +4315,125 @@ class BaseNode(AutoSshContainerMixin):
             self.log.info("Waiting for scylla-manager-agent to be ready")
             self.wait_manager_agent_up(verbose=verbose, timeout=180)
 
-    def disable_firewall(self) -> None:
-        if self.distro.is_rhel_like:
-            self.remoter.sudo("systemctl stop iptables", ignore_status=True)
-            self.remoter.sudo("systemctl disable iptables", ignore_status=True)
-            self.remoter.sudo("systemctl stop firewalld", ignore_status=True)
-            self.remoter.sudo("systemctl disable firewalld", ignore_status=True)
+    def disable_firewall(self, verify: bool = True) -> None:
+        """Disable the guest firewall, in a way which survives a reboot.
 
-        # For Ubuntu/Debian, specially on OCI where iptables rules might be persistent
-        elif self.distro.is_debian_like:
-            self.remoter.sudo("iptables -F", ignore_status=True)
-            self.remoter.sudo("iptables -P INPUT ACCEPT", ignore_status=True)
-            self.remoter.sudo("iptables -P FORWARD ACCEPT", ignore_status=True)
-            self.remoter.sudo("iptables -P OUTPUT ACCEPT", ignore_status=True)
-            self.remoter.sudo("netfilter-persistent flush", ignore_status=True)
+        The cloud images used on OCI ship a restrictive ruleset (only port 22 is accepted,
+        everything else is REJECTed with icmp-host-prohibited) which is re-applied on every
+        boot. Flushing the live tables is therefore not enough: after a reboot the node
+        serves CQL locally but looks unreachable to its peers, to the loaders and to
+        `wait_db_up()`, while SSH keeps working. So the boot-time restore has to go as well.
+
+        The nodes get this done at first boot from cloud-init already
+        (`DisableFirewallUserDataObject`); this runs the very same script at node setup, for
+        the images and the backends that path does not cover, and verifies the outcome either
+        way. The script needs no distro branch of its own: every command in it is guarded, so
+        the tools a distro does not have simply contribute nothing.
+
+        Args:
+            verify: raise `FirewallNotDisabled` when the node still rejects inbound traffic
+                after this ran. Pass False only where a caller handles the state itself.
+        """
+        self.remoter.sudo(shell_script_cmd(disable_firewall_script(), quote="'"), ignore_status=True)
+
+        if verify:
+            self.verify_firewall_disabled()
+
+    def get_firewall_rules(self, strict: bool = False) -> str:
+        """Return the live netfilter rules of the node: IPv4, IPv6 and native nftables.
+
+        Every tool is queried on its own, and one which is not installed contributes nothing -
+        a node with no ip6tables has no IPv6 rules to block anything with.
+
+        Args:
+            strict: raise `FirewallNotDisabled` when an installed tool fails to dump its rules,
+                instead of reporting the failure as part of the output. A failed dump must not
+                read as "no rules" to a caller which is verifying that nothing blocks traffic.
+
+        Returns:
+            The concatenated dumps, each under a `# <command>` header.
+
+        Raises:
+            FirewallNotDisabled: in strict mode, when the rules cannot be read.
+        """
+        dumps = []
+        for command in FIREWALL_RULE_DUMP_COMMANDS:
+            tool = command.split()[0]
+            # one round trip per tool: a missing tool exits 0 with no output, a broken one fails
+            result = self.remoter.sudo(
+                f"bash -c 'command -v {tool} >/dev/null || exit 0; {command}'",
+                ignore_status=True,
+                verbose=False,
+                timeout=60,
+            )
+            if not result.ok:
+                if strict:
+                    raise FirewallNotDisabled(
+                        f"Node {self.name}: cannot tell whether the firewall is disabled, "
+                        f"`{command}` failed: {result.stderr.strip() or result.return_code}"
+                    )
+                dumps.append(f"# {command} FAILED: {result.stderr.strip() or result.return_code}")
+                continue
+            if result.stdout.strip():
+                dumps.append(f"# {command}\n{result.stdout}")
+        return "\n".join(dumps)
+
+    def verify_firewall_disabled(self) -> None:
+        """Fail loudly when the node still rejects the traffic coming to it.
+
+        `disable_firewall()` ignores the status of every command it runs, since which of them
+        applies depends on the distro and on the image. A firewall which silently stayed up is
+        exactly the failure this check exists to catch, so the result has to be verified.
+
+        Only what blocks inbound traffic counts - see `find_blocking_firewall_rules()`.
+
+        Raises:
+            FirewallNotDisabled: when a blocking rule is found, or the rules cannot be read.
+        """
+        blocking = self.find_blocking_firewall_rules(self.get_firewall_rules(strict=True))
+        if blocking:
+            raise FirewallNotDisabled(
+                f"Node {self.name} still has firewall rules which may block the traffic to it:\n" + "\n".join(blocking)
+            )
+
+    def find_blocking_firewall_rules(self, rules: str) -> list[str]:
+        """The rules of a netfilter dump which can block the traffic coming to the node.
+
+        Only the inbound paths count: the INPUT chain of either iptables family, and the
+        nftables chains hooked into input - both their default policy and the rules which
+        drop or reject a packet under a policy which accepts it. FORWARD is left alone, it
+        carries the DROP rules docker installs for its own bridges on every loader.
+
+        After `disable_firewall()` has run an input chain has no such rule left, so anything
+        found here is a ruleset which came back, or was never taken down.
+
+        Args:
+            rules: the dumps `get_firewall_rules()` returns, headers included.
+
+        Returns:
+            The offending rules, as they appear in the dump. Empty when nothing blocks.
+        """
+        blocking = []
+        depth = 0
+        input_chain_depth = None
+        for dumped in rules.splitlines():
+            rule = dumped.strip()
+            if rule.startswith("#"):
+                # the header of the next dump: nothing of the previous one is still open
+                depth, input_chain_depth = 0, None
+                continue
+            if re.match(r"-A INPUT .*-j\s+(REJECT|DROP)", rule) or re.match(r":INPUT\s+(DROP|REJECT)", rule):
+                blocking.append(rule)
+            elif input_chain_depth == depth and re.search(r"\b(drop|reject)\b", rule):
+                blocking.append(rule)
+            elif "hook input" in rule:
+                input_chain_depth = depth
+                if re.search(r"policy\s+(drop|reject)", rule):
+                    blocking.append(rule)
+            depth += rule.count("{") - rule.count("}")
+            if input_chain_depth is not None and depth < input_chain_depth:
+                input_chain_depth = None
+        return blocking
 
     def upgrade_ssh_packages(self) -> None:
         """
@@ -4310,9 +4610,9 @@ class BaseCluster:
                     for idx in range(num):
                         nodes_per_az[idx % azs] += 1
                     for az_index in range(azs):
-                        # NOTE: OCI pre-provisioner places VMs using per-node round-robin
+                        # NOTE: OCI and GCE pre-provisioners place VMs using per-node round-robin
                         #       so rack must be 'None' to let the 'add_nodes' derive it from the 'node_index'.
-                        if self.params.get("simulated_racks") or self.params.get("cluster_backend") == "oci":
+                        if self.params.get("simulated_racks") or self.params.get("cluster_backend") in ("oci", "gce"):
                             rack = None
                         else:
                             rack = az_index
@@ -4325,7 +4625,7 @@ class BaseCluster:
                 for idx in range(n_nodes):
                     nodes_per_az[idx % azs] += 1
                 for az_index in range(azs):
-                    if self.params.get("simulated_racks") or self.params.get("cluster_backend") == "oci":
+                    if self.params.get("simulated_racks") or self.params.get("cluster_backend") in ("oci", "gce"):
                         rack = None
                     else:
                         rack = az_index
@@ -4339,7 +4639,7 @@ class BaseCluster:
     @lru_cache(maxsize=None)
     def get_keyspace_info(self, keyspace_name: str, db_node: BaseNode):
         replication_strategy = ReplicationStrategy.get(db_node, keyspace_name)
-        logging.debug("Replication strategy for keyspace %s: %s", keyspace_name, replication_strategy)
+        LOGGER.debug("Replication strategy for keyspace %s: %s", keyspace_name, replication_strategy)
         return replication_strategy
 
     def __str__(self):
@@ -5278,6 +5578,18 @@ class NodeSetupTimeout(Exception):
     pass
 
 
+def _drain_queued_failures(task_queue: queue.Queue) -> list[tuple]:
+    """Pop every result already waiting on `task_queue` and return the failed ones."""
+    failures = []
+    while True:
+        try:
+            node, exception_details = task_queue.get_nowait()
+        except queue.Empty:
+            return failures
+        if exception_details:
+            failures.append((node, exception_details))
+
+
 def wait_for_init_wrap(method):
     """
     Wraps wait_for_init class method.
@@ -5338,6 +5650,11 @@ def wait_for_init_wrap(method):
             try:
                 node, setup_exception = task_queue.get(block=True, timeout=5)
                 if setup_exception:
+                    # nodes usually fail together on a shared cause, and only the first result off
+                    # the queue is ever reported - log whatever else already failed so the shared
+                    # cause is visible instead of looking like a single-node problem
+                    for other_node, other_exception in _drain_queued_failures(task_queue):
+                        cl_inst.log.error("Node %s also failed setup/startup: %s", other_node, other_exception[0])
                     raise NodeSetupFailed(node=node, error_msg=setup_exception[0], traceback_str=setup_exception[1])
                 results.append(node)
                 cl_inst.log.info(
@@ -5461,11 +5778,36 @@ class BaseScyllaCluster:
         return "db_nodes_public_ip" if public_ip else "db_nodes_private_ip"
 
     def get_scylla_args(self):
-        return (
+        args = (
             self.params.get("append_scylla_args_oracle")
             if self.name.find("oracle") > 0
             else self.params.get("append_scylla_args")
         )
+        return self._append_minicloud_reserve_memory(args or "")
+
+    def _append_minicloud_reserve_memory(self, args: str) -> str:
+        """Leave the guest OS room to breathe on a lightweight minicloud guest.
+
+        Appended rather than configured, because append_scylla_args is one flat string: a
+        minicloud overlay that set it would replace whatever the test-case yaml put there,
+        silently dropping the abort-on-* guards every run relies on.
+        """
+        if not is_minicloud_active(self.params):
+            return args
+
+        tokens = args.split()
+        has_mem_arg = any(
+            token in ("-m", "--memory", "--reserve-memory") or token.startswith(("--memory=", "--reserve-memory="))
+            for token in tokens
+        )
+        if has_mem_arg:
+            return args
+
+        if not (reserve := scylla_reserve_memory(self.params)):
+            return args
+
+        self.log.info("minicloud: reserving %s of guest memory for the OS (--reserve-memory)", reserve)
+        return f"{args} --reserve-memory {reserve}".strip()
 
     def get_rack_nodes(self, rack: int) -> list:
         return sorted([node for node in self.nodes if node.rack == rack], key=lambda n: n.name)
@@ -5636,7 +5978,7 @@ class BaseScyllaCluster:
             node.remoter.send_files(new_scylla_bin, "/tmp/scylla", verbose=True)
 
             self._wait_for_preinstalled_scylla(node)
-            logging.info("unzipping any tar.gz rpms")
+            LOGGER.info("unzipping any tar.gz rpms")
             node.remoter.run("tar -xvf /tmp/scylla/*.tar.gz -C /tmp/scylla/", ignore_status=True, verbose=True)
 
             # replace the packages
@@ -6207,9 +6549,6 @@ class BaseScyllaCluster:
                 node.remoter.sudo("systemctl restart syslog-ng")
             elif self.params.get("logs_transport") == "vector":
                 node.remoter.sudo("systemctl restart vector")
-        if self.test_config.BACKTRACE_DECODING:
-            node.install_scylla_debuginfo()
-
         simulated_regions_num = self.params.get("simulated_regions")
         if self.test_config.MULTI_REGION or simulated_regions_num > 1 or self.params.get("simulated_racks") > 1:
             if simulated_regions_num > 1:
@@ -6321,6 +6660,10 @@ class BaseScyllaCluster:
         if not baseline_logs:
             node.log.info("NVMe diagnostics: no NVMe data disks found, skipping")
             return
+
+        # Error and media counters are lifetime totals, so the teardown health
+        # check compares against this baseline instead of against zero.
+        store_baseline_smart_logs(node, baseline_logs)
 
         for smart_log in baseline_logs:
             node.log.info(
@@ -6698,13 +7041,18 @@ class BaseScyllaCluster:
         return self.name
 
     def get_cluster_manager(
-        self, create_if_not_exists: bool = True, force_add: bool = False, **add_cluster_extra_params
+        self,
+        create_if_not_exists: bool = True,
+        force_add: bool = False,
+        retry_listing: bool = False,
+        **add_cluster_extra_params,
     ) -> AnyManagerCluster:
         """Get the Manager cluster if it already exists, otherwise create it.
 
         Args:
             create_if_not_exists: If True, create the cluster if it does not exist.
             force_add: If True, re-add the cluster (delete and add again) even if it already added.
+            retry_listing: If True, retry `sctool cluster list` attempt
             add_cluster_extra_params: Pass additional parameters (like 'client_encrypt') to the add_cluster method.
         """
         if not self.params.get("use_mgmt"):
@@ -6713,7 +7061,7 @@ class BaseScyllaCluster:
         cluster_name = self.scylla_manager_cluster_name
 
         manager_tool = mgmt.get_scylla_manager_tool(manager_node=self.scylla_manager_node, scylla_cluster=self)
-        mgr_cluster = manager_tool.get_cluster(cluster_name)
+        mgr_cluster = manager_tool.get_cluster(cluster_name, retry_listing=retry_listing)
 
         if mgr_cluster and force_add:
             LOGGER.debug("Cluster '%s' already exists in Manager. Deleting and adding it again", cluster_name)
@@ -7124,7 +7472,7 @@ class BaseMonitorSet:
         self.configure_overview_template(node)
         try:
             self.start_scylla_monitoring(node)
-        except (Failure, UnexpectedExit, Libssh2_UnexpectedExit):
+        except Failure, UnexpectedExit, Libssh2_UnexpectedExit:
             self.restart_scylla_monitoring()
         # The time will be used in url of Grafana monitor,
         # the data from this point to the end of test will
@@ -7146,6 +7494,13 @@ class BaseMonitorSet:
         else:
             manager_scylla_backend_version = self.params.get("manager_scylla_backend_version")
             scylla_repo = get_manager_scylla_backend(manager_scylla_backend_version, node.distro)
+        # The monitoring image ships its own, independently versioned scylla-node-exporter
+        # (epoch based, e.g. `1:1.11.1-2`). The manager backend is an older Scylla release
+        # whose `scylla` package still pins it exactly -- `Depends: scylla-node-exporter
+        # (= 2025.4.10-...)` -- and the package manager will not downgrade across the epoch,
+        # so the install dies with "held broken packages". Drop it first; install_scylla
+        # pulls the matching version back in as a dependency.
+        node.remove_package("scylla-node-exporter")
         node.install_scylla(scylla_repo=scylla_repo)
         package_path = self.params.get("scylla_mgmt_pkg")
         if package_path:
@@ -7361,11 +7716,12 @@ class BaseMonitorSet:
         return Path(get_data_dir_path("monitoring-dash-template.json"))
 
     def configure_overview_template(self, node: BaseNode):
-        def find_overview_row(row):
-            return (
-                row["class"] == "row"
+        def contains_alert_table(group):
+            return any(
+                row.get("class") == "row"
                 and len(row.get("panels", [])) > 0
                 and row["panels"][0].get("class", "") == "alert_table"
+                for row in group.get("rows", [])
             )
 
         with remote_file(
@@ -7375,39 +7731,37 @@ class BaseMonitorSet:
             sct_addon_template = json.load(self.monitoring_template.open("rt"))
             template = json.load(file)
             try:
-                template["dashboard"]["title"] = (
+                template["dashboard"]["spec/title"] = (
                     f"[{self.json_file_params_for_replace['$test_name']}] SCT Metrics & Cluster Overview"
                 )
             except KeyError:
                 LOGGER.warning("Unable to set title for overview dashboard - key not found")
 
-            row, index = next(
-                ((row, i) for i, row in enumerate(template["dashboard"]["rows"]) if find_overview_row(row)), (None, -1)
-            )
-            if row:
-                before = template["dashboard"]["rows"][: index + 1]
-                after = template["dashboard"]["rows"][index + 1 :]
-                rows = [*before, *sct_addon_template["rows"], *after]
-            template["dashboard"]["rows"] = rows
-            for variable in sct_addon_template["variables"]:
-                template["dashboard"]["templating"]["list"].append(variable)
+            rows = template["dashboard"]["rows"]
+            index = next((i for i, group in enumerate(rows) if contains_alert_table(group)), -1)
+            if index < 0:
+                LOGGER.warning("Unable to find the cluster overview row - appending SCT rows at the end")
+                index = len(rows) - 1
+            template["dashboard"]["rows"] = [*rows[: index + 1], *sct_addon_template["rows"], *rows[index + 1 :]]
+
+            template["dashboard"].setdefault("spec/variables", []).extend(sct_addon_template["variables"])
 
             try:
                 variable = next(
                     var
-                    for var in template["dashboard"]["templating"]["list"]
-                    if var.get("class", "") == "by_template_var"
+                    for var in template["dashboard"]["spec/variables"]
+                    if var.get("kind", "") == "CustomVariable" and var.get("spec", {}).get("name", "") == "by"
                 )
-                for value in variable["options"]:
+                for value in variable["spec"]["options"]:
                     value["selected"] = False
-                variable["current"]["text"] = "Instance"
-                variable["current"]["value"] = "instance"
-                by_instance_option = next(opt for opt in variable["options"] if opt["text"] == "Instance")
+                variable["spec"]["current"]["text"] = "Instance"
+                variable["spec"]["current"]["value"] = "instance"
+                by_instance_option = next(opt for opt in variable["spec"]["options"] if opt["text"] == "Instance")
                 by_instance_option["selected"] = True
-            except (StopIteration, KeyError):
+            except StopIteration, KeyError:
                 LOGGER.warning("Unable to change defaults for the template", exc_info=True)
 
-            template["dashboard"]["annotations"] = sct_addon_template["annotations"]
+            template["dashboard"].setdefault("spec/annotations", []).extend(sct_addon_template["annotations"])
 
             file.seek(0)
             file.truncate()
@@ -7774,11 +8128,17 @@ class BaseMonitorSet:
 
     def add_sct_dashboards_to_grafana(self, node):
         def _register_grafana_json(json_filename):
-            url = f"'http://{normalize_ipv6_url(node.external_address)}:{self.grafana_port}/api/dashboards/db'"
-            result = LOCALRUNNER.run(
-                'curl -g -XPOST -i %s --data-binary @%s -H "Content-Type: application/json"' % (url, json_filename)
-            )
-            return result.exited == 0
+            base_url = f"http://{normalize_ipv6_url(node.external_address)}:{self.grafana_port}"
+            with open(json_filename, encoding="utf-8") as f:
+                legacy_payload = json.load(f)
+            try:
+                result = upload_dashboard(base_url, legacy_payload)
+            except requests.ConnectionError:
+                # grafana is still starting up, wait_for will call us again
+                return False
+            if not result.ok:
+                LOGGER.warning("failed to register grafana dashboard %s: %s", json_filename, result.text)
+            return result.ok
 
         wait.wait_for(
             _register_grafana_json,
@@ -7853,13 +8213,13 @@ class BaseMonitorSet:
         if not self.is_formal_monitor_image:
             self.download_scylla_monitoring(node)
 
+    def _grafana_annotations_url(self, node):
+        return f"http://{normalize_ipv6_url(node.grafana_address)}:{self.grafana_port}{GRAFANA_ANNOTATIONS_API_PATH}"
+
     def get_grafana_annotations(self, node):
-        annotations_url = "http://{node_ip}:{grafana_port}/api/annotations?limit=10000"
         try:
-            res = requests.get(
-                url=annotations_url.format(
-                    node_ip=normalize_ipv6_url(node.grafana_address), grafana_port=self.grafana_port
-                )
+            res = create_retry_session().get(
+                url=f"{self._grafana_annotations_url(node)}?limit=10000", timeout=DEFAULT_GRAFANA_TIMEOUT
             )
             if res.ok:
                 return res.content
@@ -7868,13 +8228,11 @@ class BaseMonitorSet:
         return ""
 
     def set_grafana_annotations(self, node, annotations_data):
-        annotations_url = "http://{node_ip}:{grafana_port}/api/annotations"
-        res = requests.post(
-            url=annotations_url.format(
-                node_ip=normalize_ipv6_url(node.grafana_address), grafana_port=self.grafana_port
-            ),
+        res = create_retry_session().post(
+            url=self._grafana_annotations_url(node),
             data=annotations_data,
             headers={"Content-Type": "application/json"},
+            timeout=DEFAULT_GRAFANA_TIMEOUT,
         )
         self.log.info("posting annotations result: %s", res)
 

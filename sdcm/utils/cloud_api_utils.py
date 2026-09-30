@@ -78,3 +78,23 @@ def get_cloud_rest_credentials_from_file(file_path: str) -> dict:
     with path.open("r", encoding="utf-8") as creds_file:
         creds = json.load(creds_file)
     return creds
+
+
+def parse_availability_zones(value: str | None) -> list[str]:
+    """Parse a comma-separated availability zone list from config into a clean list"""
+    return [zone.strip() for zone in (value or "").split(",") if zone.strip()]
+
+
+def expand_availability_zones(zones: list[str], node_count: int) -> list[str]:
+    """Expand the configured AZ list to one entry per node."""
+    if not zones:
+        return []
+
+    zone_count = len(zones)
+    if node_count % zone_count:
+        raise ValueError(
+            f"Cannot spread {node_count} nodes evenly across {zone_count} availability zones {zones}. "
+            f"Provide one zone per node or a list that divides the node count evenly."
+        )
+
+    return zones * (node_count // zone_count)

@@ -9,8 +9,8 @@ fallback_to_next_region: true
 gce_project: '' # empty mean default one, can be overwritten to use different one
 
 gce_image_db: '' # so we can use `scylla_version` as needed
-gce_image_loader: 'https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-2604-lts-amd64'
-gce_image_monitor: 'https://www.googleapis.com/compute/v1/projects/scylla-images/global/images/scylladb-monitor-4-15-0-rc0-2026-04-30t01-12-58z'
+gce_image_loader: 'https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-2604-lts-{arch}'
+gce_image_monitor: 'https://www.googleapis.com/compute/v1/projects/scylla-images/global/images/scylladb-monitor-4-16-0-amd64-2026-08-30t08-46-39z'
 
 gce_image_username: 'scylla-test'
 
@@ -24,6 +24,8 @@ root_disk_size_monitor: 50
 gce_n_local_ssd_disk_monitor: 0
 
 gce_instance_type_db: ''
+gce_instance_type_db_oracle: ''
+gce_image_db_oracle: ''
 gce_root_disk_type_db: 'pd-ssd'
 root_disk_size_db: 50
 gce_n_local_ssd_disk_db: 4

@@ -68,7 +68,13 @@ from sdcm.cluster_k8s import (
 )
 from sdcm.log import SDCMAdapter
 from sdcm.logcollector import save_kallsyms_map
-from sdcm.mgmt.common import TaskStatus, ScyllaManagerError, get_persistent_snapshots, ObjectStorageUploadMode
+from sdcm.mgmt.common import (
+    TaskStatus,
+    TERMINAL_TASK_STATUSES,
+    ScyllaManagerError,
+    get_persistent_snapshots,
+    ObjectStorageUploadMode,
+)
 from sdcm.mgmt.backup import run_manager_backup
 from sdcm.mgmt.argus_report import report_manager_backup_results_to_argus
 from sdcm.mgmt.helpers import get_dc_name_from_ks_statement, get_schema_create_statements_from_snapshot
@@ -167,6 +173,7 @@ from sdcm.exceptions import (
     BootstrapStreamErrorFailure,
     QuotaConfigurationFailure,
     NemesisStressFailure,
+    WaitForTimeoutError,
 )
 from test_lib.compaction import (
     CompactionStrategy,
@@ -1006,10 +1013,14 @@ class NemesisRunner:
 
         return file_for_destroy if return_one_file else all_files
 
-    def get_all_sstables(self, tables: list[str], node: BaseNode = None):
+    def get_all_sstables(self, tables: list[str], node: BaseNode = None, skip_sstables_with_tombstones: bool = False):
         """
         :param tables: list of tables. Format of name: <keyspace_name.table_name>
         :param node: get SStables from the node
+        :param skip_sstables_with_tombstones: when True, exclude sstables that contain tombstones.
+            Required for destroy/corruption flows that are followed by a repair. The filtering is an
+            offline check - the caller must make sure the sstable set cannot change while it runs.
+            See `SstableUtils.filter_out_sstables_with_tombstones`.
         """
         node = node or self.target_node
 
@@ -1017,6 +1028,8 @@ class NemesisRunner:
         for ks_cf in tables:
             sstable_util = SstableUtils(db_node=node, ks_cf=ks_cf)
             ks_cf_sstables = sstable_util.get_sstables()
+            if skip_sstables_with_tombstones:
+                ks_cf_sstables = sstable_util.filter_out_sstables_with_tombstones(ks_cf_sstables)
             sstables.extend(ks_cf_sstables)
 
         self.log.debug("All Sstables are: %s", sstables)
@@ -1024,7 +1037,12 @@ class NemesisRunner:
         return sstables
 
     @decorate_with_context(suppress_expected_unavailability_errors)
-    def _destroy_data_and_restart_scylla(self, keyspaces_for_destroy: list = None, sstables_to_destroy_perc: int = 50):
+    def _destroy_data_and_restart_scylla(
+        self,
+        keyspaces_for_destroy: list = None,
+        sstables_to_destroy_perc: int = 50,
+        skip_sstables_with_tombstones: bool = False,
+    ):
         tables = self.cluster.get_non_system_ks_cf_list(
             db_node=self.target_node, filter_empty_tables=False, filter_by_keyspace=keyspaces_for_destroy
         )
@@ -1038,15 +1056,30 @@ class NemesisRunner:
             self.target_node.stop_scylla_server(verify_up=False, verify_down=True)
 
         try:
-            # Remove data files
-            if not (all_files_to_destroy := self.get_all_sstables(tables=tables, node=self.target_node)):
-                raise UnsupportedNemesis("SStables for destroy are not found. The nemesis can't be run")
+            # Remove data files - deleting a tombstone-bearing sstable can resurrect the data it
+            # shadows, and a following repair then propagates it to the other replicas. So with
+            # skip_sstables_with_tombstones=True only tombstone-free sstables are destroy candidates,
+            # and the target percentage is applied to that filtered pool.
+            # Scylla is already stopped above, so the sstable set is frozen while it is inspected.
+            # Ref: https://scylladb.atlassian.net/browse/SCT-750
+            if not (
+                all_files_to_destroy := self.get_all_sstables(
+                    tables=tables, node=self.target_node, skip_sstables_with_tombstones=skip_sstables_with_tombstones
+                )
+            ):
+                msg = (
+                    "All sstables contain tombstones - none is safe to destroy. The nemesis can't be run"
+                    if skip_sstables_with_tombstones
+                    else "SStables for destroy are not found. The nemesis can't be run"
+                )
+                raise UnsupportedNemesis(msg)
 
-            # How many SStables are going to be deleted
             sstables_amount_to_destroy = int(len(all_files_to_destroy) * sstables_to_destroy_perc / 100)
+
             self.log.debug(
-                "SStables amount to destroy (%s percent of all SStables): %s",
+                "SStables amount to destroy (%s percent of %s SStables): %s",
                 sstables_to_destroy_perc,
+                "tombstone-free" if skip_sstables_with_tombstones else "all",
                 sstables_amount_to_destroy,
             )
 
@@ -1092,7 +1125,9 @@ class NemesisRunner:
     def disrupt_destroy_data_then_repair(self):
         """repair at the beginning added to avoid c-s failure 'data wasn't validated'"""
         self.run_repair()
-        self._destroy_data_and_restart_scylla()
+        # Skip sstables with tombstones: deleting them could resurrect shadowed data, and the
+        # following repair would then propagate the resurrected data to the other replicas.
+        self._destroy_data_and_restart_scylla(skip_sstables_with_tombstones=True)
         # try to save the node
         self.run_repair()
 
@@ -1240,7 +1275,7 @@ class NemesisRunner:
             self.cluster.clean_replacement_node_options(new_node)
             self.cluster.set_seeds()
             self.cluster.update_seed_provider()
-        except (NodeSetupFailed, NodeSetupTimeout):
+        except NodeSetupFailed, NodeSetupTimeout:
             self.log.warning("TestConfig of the '%s' failed, collecting logs and terminating node" % new_node)
             self.cluster.terminate_node(new_node)
             raise
@@ -1291,7 +1326,7 @@ class NemesisRunner:
             self.actions_log.info(f"New nodes initialized: {nodes_names}")
             self.cluster.set_seeds()
             self.cluster.update_seed_provider()
-        except (NodeSetupFailed, NodeSetupTimeout):
+        except NodeSetupFailed, NodeSetupTimeout:
             self.log.warning("TestConfig of the '%s' failed, collecting logs and terminating nodes" % new_nodes)
             for node in new_nodes:
                 self.cluster.terminate_node(node)
@@ -2070,15 +2105,32 @@ class NemesisRunner:
         return excluded
 
     def build_disruptions_by_name(self, disrupt_methods: List[str]):
-        """Builds list of available disruptions according to class names"""
+        """Builds list of available disruptions according to class names, honoring the
+        active nemesis_selector.
+
+        Raises if a name matches no known nemesis class (a typo, or a class that was
+        renamed or split). A name that exists but is excluded by the active selector (for
+        example a non-kubernetes nemesis while running on a kubernetes backend, where
+        build_disruptions_by_selector ANDs in "kubernetes") is expected and is skipped with
+        a warning instead. Raises if the selector excludes every requested name.
+        """
+        requested = set(disrupt_methods)
+        known = {cls.__name__ for cls in self.nemesis_registry.get_subclasses()}
+        if unknown := requested - known:
+            raise ValueError(f"Unknown nemesis class names in {disrupt_methods}: {sorted(unknown)}")
+
         method_selector = " or ".join(disrupt_methods)
         selector = f"{self.nemesis_selector} and ({method_selector})" if self.nemesis_selector else method_selector
         filtered = self.build_disruptions_by_selector(selector)
-        names = [func.__class__.__name__ for func in filtered]
-        assert names == disrupt_methods, (
-            f"Unable to find these disrupt methods: {set(disrupt_methods).difference(names)}"
-        )
-        return filtered
+        by_name = {func.__class__.__name__: func for func in filtered}
+
+        if excluded_by_selector := requested - by_name.keys():
+            self.log.warning(
+                "Nemesis excluded by active selector %r: %s", self.nemesis_selector, sorted(excluded_by_selector)
+            )
+        if not by_name:
+            raise ValueError(f"No nemesis left from {disrupt_methods} under selector {self.nemesis_selector!r}")
+        return list(by_name.values())
 
     @property
     def nemesis_selector(self) -> str:
@@ -2135,21 +2187,37 @@ class NemesisRunner:
     def run_repair_nodetool(self, nodes: list, publish_event=True, timeout=HOUR_IN_SEC * 3):
         """
         Execute a repair using Nodetool, which runs both vnode repair (repair) and tablet repairs (cluster repair)
+
+        The command timeout is the repair adaptive timeout: the given `timeout` scaled by the
+        `adaptive_timeout_multipliers` config param (`{repair: N}`), so tests with longer repairs
+        tune it per-test yaml. On expiry the command fails and a SoftTimeoutEvent is emitted.
         """
         for node in nodes:
             with (
-                adaptive_timeout(Operations.REPAIR, node, timeout=timeout),
+                adaptive_timeout(Operations.REPAIR, node, timeout=timeout) as repair_timeout,
                 self.action_log_scope(f"nodetool repair on {node.name} node"),
             ):
-                node.run_nodetool(sub_cmd="repair", publish_event=publish_event)
+                node.run_nodetool(
+                    sub_cmd="repair",
+                    publish_event=publish_event,
+                    timeout=repair_timeout,
+                    long_running=True,
+                    retry=0,
+                )
 
         target_node = nodes[0]
         if is_tablets_feature_enabled(target_node):
             with (
-                adaptive_timeout(Operations.REPAIR, target_node, timeout=timeout),
+                adaptive_timeout(Operations.REPAIR, target_node, timeout=timeout) as repair_timeout,
                 self.action_log_scope("nodetool cluster repair", target=target_node.name),
             ):
-                target_node.run_nodetool(sub_cmd="cluster repair", publish_event=publish_event)
+                target_node.run_nodetool(
+                    sub_cmd="cluster repair",
+                    publish_event=publish_event,
+                    timeout=repair_timeout,
+                    long_running=True,
+                    retry=0,
+                )
 
     @latency_calculator_decorator(legend="Run repair process through Scylla manager", cycle_name="_mgmt_repair_cli")
     def run_repair_manager(self, ignore_down_hosts: bool = False, timeout=HOUR_IN_SEC * 3):
@@ -2598,7 +2666,7 @@ class NemesisRunner:
 
     def _verify_using_timestamp_deletions(self, ks_cf: str, verification_queries: list[tuple[int, int, int]]):
         mv_not_configured = False
-        mv_table_name = ".".join([ks_cf.split(sep=".")[0], "view_test"])
+        mv_table_name = ".".join([ks_cf.split(maxsplit=1, sep=".")[0], "view_test"])
         with self.cluster.cql_connection_patient(self.target_node, connect_timeout=300) as session:
             for pk, ck, ts in verification_queries:
                 result = session.execute(
@@ -2956,15 +3024,7 @@ class NemesisRunner:
             chosen_snapshot_size = self.random.choice(fitting_snapshot_sizes)
             all_snapshots_per_region = snapshot_groups_by_size[chosen_snapshot_size]["snapshots"][region]
 
-            if self.cluster.nodes[0].is_enterprise:
-                snapshot_tag = self.random.choice(list(all_snapshots_per_region.keys()))
-            else:
-                oss_snapshots = [
-                    snapshot_key
-                    for snapshot_key, snapshot_value in all_snapshots_per_region.items()
-                    if snapshot_value["scylla_product"] == "oss"
-                ]
-                snapshot_tag = self.random.choice(oss_snapshots)
+            snapshot_tag = self.random.choice(list(all_snapshots_per_region.keys()))
 
             snapshot_info = all_snapshots_per_region[snapshot_tag]
             snapshot_info.update(
@@ -3045,7 +3105,7 @@ class NemesisRunner:
         if self.cluster.params.get("cluster_backend") not in ("aws", "k8s-eks"):
             raise UnsupportedNemesis("The restore test only supports 'AWS' and 'K8S-EKS' backends.")
 
-        mgr_cluster = self.cluster.get_cluster_manager()
+        mgr_cluster = self.cluster.get_cluster_manager(retry_listing=True)
         cluster_backend = self.cluster.params.get("cluster_backend")
         if cluster_backend == "k8s-eks":
             cluster_backend = "aws"
@@ -3078,6 +3138,7 @@ class NemesisRunner:
             #
             # self.tester.set_ks_strategy_to_network_and_rf_according_to_cluster(
             #    keyspace=chosen_snapshot_info["keyspace_name"], repair_after_alter=False)
+        restore_task = None
         try:
             restore_task = mgr_cluster.create_restore_task(
                 restore_data=True, location_list=location_list, snapshot_tag=chosen_snapshot_tag
@@ -3100,12 +3161,47 @@ class NemesisRunner:
                     "Data verification stress command, triggered by the 'mgmt_restore' nemesis, has failed"
                 )
         finally:
-            self.log.info("Cleaning up restored keyspace '%s'", chosen_snapshot_info["keyspace_name"])
-            drop_ks_stmt = f'DROP KEYSPACE IF EXISTS "{chosen_snapshot_info["keyspace_name"]}";'
+            self._stop_unfinished_restore_task(restore_task)
+            keyspace_name = chosen_snapshot_info["keyspace_name"]
+            self.log.info("Cleaning up restored keyspace '%s'", keyspace_name)
+            drop_ks_stmt = f'DROP KEYSPACE IF EXISTS "{keyspace_name}";'
             try:
                 self.target_node.run_cqlsh(drop_ks_stmt)
             except Exception as drop_err:  # noqa: BLE001
                 self.log.warning("Failed to drop restored keyspace: %s", drop_err)
+
+    def _stop_unfinished_restore_task(self, restore_task) -> None:
+        """Stop a Manager restore task that hasn't reached a final status yet.
+
+        A WaitForTimeoutError from wait_and_get_final_status only means SCT gave up waiting; the
+        task may still be RUNNING. This method issues an sctool stop and waits for a terminal
+        status so the task is no longer touching the keyspace before the caller cleans it up.
+
+        Best effort only: every failure here is logged and swallowed rather than masking the
+        original error that brought us into the finally block.
+        """
+        if restore_task is None:
+            return
+        try:
+            status = restore_task.status
+            if status in TERMINAL_TASK_STATUSES:
+                return
+            self.log.warning(
+                "Restore task %s is still in %s state - stopping it",
+                restore_task.id,
+                status,
+            )
+            try:
+                restore_task.stop()
+            except WaitForTimeoutError:
+                pass
+            restore_task.wait_for_status(list_status=TERMINAL_TASK_STATUSES, timeout=600, step=30)
+        except Exception as stop_err:  # noqa: BLE001
+            self.log.warning(
+                "Failed to stop the restore task %s: %s",
+                restore_task.id,
+                stop_err,
+            )
 
     def _delete_existing_backups(self, mgr_cluster):
         deleted_tasks = []
@@ -3125,7 +3221,7 @@ class NemesisRunner:
     def _mgmt_backup(self, backup_specific_tables):
         if not self.cluster.params.get("use_mgmt") and not self.cluster.params.get("use_cloud_manager"):
             raise UnsupportedNemesis("Scylla-manager configuration is not defined!")
-        mgr_cluster = self.cluster.get_cluster_manager()
+        mgr_cluster = self.cluster.get_cluster_manager(retry_listing=True)
         if self.cluster.params.get("use_cloud_manager"):
             auto_backup_task = mgr_cluster.backup_task_list[0]
             #  An example of the auto generated backup task of cloud manager is:
@@ -3180,7 +3276,9 @@ class NemesisRunner:
     def disrupt_mgmt_corrupt_then_repair(self):
         if not self.cluster.params.get("use_mgmt") and not self.cluster.params.get("use_cloud_manager"):
             raise UnsupportedNemesis("Scylla-manager configuration is not defined!")
-        self._destroy_data_and_restart_scylla()
+        # Skip sstables with tombstones: deleting them could resurrect shadowed data, and the
+        # following manager repair would then propagate the resurrected data to the other replicas.
+        self._destroy_data_and_restart_scylla(skip_sstables_with_tombstones=True)
         self.run_repair_manager()
 
     def disrupt_abort_repair(self):
@@ -3202,7 +3300,7 @@ class NemesisRunner:
                     long_running=True,
                     retry=0,
                 )
-            except (UnexpectedExit, Libssh2UnexpectedExit):
+            except UnexpectedExit, Libssh2UnexpectedExit:
                 self.actions_log.info("Repair failed as expected")
             except Exception:
                 self.log.error("Repair failed due to the unknown error")
@@ -3363,6 +3461,20 @@ class NemesisRunner:
         else:
             # Example: snapshot
             keyspace_table.extend([k_c.split(".") for k_c in ks_cf])
+
+        if ComparableScyllaVersion(self.target_node.scylla_version) >= "2026.2.0":
+            # Since https://github.com/scylladb/scylladb/commit/39baa1870e2cd84304ec453a12955fdb0a0abc61
+            # (first released in 2026.2.0), `nodetool listsnapshots` reports a secondary index's
+            # backing view under its logical index name instead of the view's physical name
+            # (which carries a "_index" suffix, e.g. "users_address_ind_index" -> "users_address_ind").
+            with self.cluster.cql_connection_patient(self.cluster.nodes[0]) as session:
+                index_backing_views = {
+                    (row.keyspace_name, f"{row.index_name}_index")
+                    for row in session.execute("SELECT keyspace_name, index_name FROM system_schema.indexes")
+                }
+            keyspace_table = [
+                [ks, cf[: -len("_index")]] if (ks, cf) in index_backing_views else [ks, cf] for ks, cf in keyspace_table
+            ]
 
         snapshot_content_list = [[elem.keyspace_name, elem.table_name] for elem in snapshot_content]
         if sorted(keyspace_table) != sorted(snapshot_content_list):
@@ -3766,7 +3878,9 @@ class NemesisRunner:
         3. Stop it with a hard reboot once the repair starts.
         4. Trigger a rebuild on the target node after the reboot.
         """
-        self._destroy_data_and_restart_scylla()
+        # Skip sstables with tombstones: deleting them could resurrect shadowed data, and the
+        # following repair would then propagate the resurrected data to the other replicas.
+        self._destroy_data_and_restart_scylla(skip_sstables_with_tombstones=True)
         trigger = partial(
             self.target_node.run_nodetool,
             sub_cmd="repair",

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 import oci
 from oci.core.models import (
+    AttachVnicDetails,
     LaunchInstanceDetails,
     LaunchInstanceShapeConfigDetails,
     CreateVnicDetails,
@@ -40,7 +41,7 @@ from sdcm.provision.provisioner import (
 )
 from sdcm.provision.user_data import UserDataBuilder
 from sdcm.utils.oci_region import OciRegion
-from sdcm.utils.oci_utils import OciService, build_hostname_label
+from sdcm.utils.oci_utils import OciService, build_hostname_label, build_image_source_details
 from sdcm.utils.parallel_object import ParallelObject
 
 LOGGER = logging.getLogger(__name__)
@@ -59,6 +60,65 @@ class VirtualMachineProvider:
         self._identity_client = self._oci_service.get_identity_client(self._region)
         self._network_client = self._oci_service.get_network_client(self._region)
         self._bs_client = self._oci_service.get_block_storage_client(self._region)
+        self._availability_domains: Optional[List] = None
+
+    def _list_availability_domains(self) -> List:
+        """Availability domains of the compartment, sorted by name. Cached, the list never changes."""
+        if self._availability_domains is None:
+            ads = self._identity_client.list_availability_domains(self._compartment_id).data
+            self._availability_domains = sorted(ads, key=lambda x: x.name)
+        return self._availability_domains
+
+    def _az_list(self) -> List[str]:
+        """AZ identifiers this provider is configured with. self._az may hold a list, i.e. "a,b,c"."""
+        return [x.strip() for x in str(self._az).split(",")]
+
+    @staticmethod
+    def _match_availability_domain(az: str, ads: List) -> Optional[str]:
+        """Resolve a single AZ identifier ("1", "a" or a full AD name) to a full AD name."""
+        # Check if it's already a full AD name
+        for ad in ads:
+            if ad.name == az:
+                return ad.name
+
+        # Try index mapping
+        index = -1
+        if az.isdigit():
+            index = int(az) - 1
+        elif len(az) == 1 and az.isalpha():
+            index = ord(az.lower()) - ord("a")
+        if 0 <= index < len(ads):
+            return ads[index].name
+
+        # Try suffix matching
+        for ad in ads:
+            if ad.name.endswith(str(az)):
+                return ad.name
+
+        return None
+
+    def _availability_domains_in_scope(self) -> set:
+        """Full names of the availability domains this provider is responsible for.
+
+        An empty set means "not scoped to any AD", i.e. the whole region.
+        """
+        if not str(self._az).strip():
+            return set()
+        ads = self._list_availability_domains()
+        in_scope = set()
+        for az in self._az_list():
+            if ad_name := self._match_availability_domain(az, ads):
+                in_scope.add(ad_name)
+            else:
+                LOGGER.warning(
+                    "Failed to resolve the '%s' availability zone (derived from configuration '%s') "
+                    "in the '%s' region. Available domains: %s",
+                    az,
+                    self._az,
+                    self._region,
+                    [ad.name for ad in ads],
+                )
+        return in_scope
 
     def _get_availability_domain(self, definition: Optional[InstanceDefinition] = None) -> str:
         """
@@ -66,9 +126,8 @@ class VirtualMachineProvider:
         Uses self._az which can be a single value ("1"), a list ("1,2,3"), or letters ("a,b,c").
         If a list is provided, distributes based on definition's NodeIndex.
         """
-        ads = self._identity_client.list_availability_domains(self._compartment_id).data
-        ads.sort(key=lambda x: x.name)
-        az_list = [x.strip() for x in str(self._az).split(",")]
+        ads = self._list_availability_domains()
+        az_list = self._az_list()
         az_to_use = az_list[0]
         if definition and len(az_list) > 1:
             try:
@@ -77,31 +136,15 @@ class VirtualMachineProvider:
                 else:
                     node_index = int(definition.tags.get("NodeIndex", 1))
                     az_to_use = az_list[(node_index - 1) % len(az_list)]
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 LOGGER.warning(
                     "Could not determine valid NodeIndex for instance %s, using first AZ: %s",
                     definition.name,
                     az_to_use,
                 )
 
-        # Check if it's already a full AD name
-        for ad in ads:
-            if ad.name == az_to_use:
-                return ad.name
-
-        # Try index mapping
-        index = -1
-        if az_to_use.isdigit():
-            index = int(az_to_use) - 1
-        elif len(az_to_use) == 1 and az_to_use.isalpha():
-            index = ord(az_to_use.lower()) - ord("a")
-        if 0 <= index < len(ads):
-            return ads[index].name
-
-        # Try suffix matching
-        for ad in ads:
-            if ad.name.endswith(str(az_to_use)):
-                return ad.name
+        if ad_name := self._match_availability_domain(az_to_use, ads):
+            return ad_name
 
         raise ProvisionError(
             f"Invalid or not found Availability Zone identifier '{az_to_use}' (derived from configuration '{self._az}') "
@@ -165,13 +208,22 @@ class VirtualMachineProvider:
         ).data
 
     def list_instances(self, test_id: str) -> List[Instance]:
-        """List instances in the compartment, optionally filtered by tags (test_id)."""
+        """List instances of this provider's availability domains, optionally filtered by tags (test_id).
+
+        NOTE: the OCI compute API is regional, so instances must be filtered by availability domain
+              here. Without it every per-AD provider of a region reports all the region's instances,
+              and callers which merge multiple providers get each instance as many times as there
+              are ADs in use.
+        """
+        ads_in_scope = self._availability_domains_in_scope()
         all_instances = oci.pagination.list_call_get_all_results(
             self._compute_client.list_instances, compartment_id=self._compartment_id
         ).data
         filtered = []
         for inst in all_instances:
             if inst.lifecycle_state == Instance.LIFECYCLE_STATE_TERMINATED:
+                continue
+            if ads_in_scope and inst.availability_domain not in ads_in_scope:
                 continue
             tags = (inst.defined_tags or {}).get(TAG_NAMESPACE, {})
             if test_id and tags.get("TestId") != test_id and test_id not in inst.display_name:
@@ -192,17 +244,17 @@ class VirtualMachineProvider:
                 if parts_num > 1:
                     try:
                         shape_config["ocpus"] = float(parts[1])
-                    except (ValueError, IndexError):
+                    except ValueError, IndexError:
                         LOGGER.warning("Failed to parse out the OCPUs config from the shape %s", definition.type)
                 if parts_num > 2:
                     try:
                         shape_config["memory_in_gbs"] = float(parts[2])
-                    except (ValueError, IndexError):
+                    except ValueError, IndexError:
                         LOGGER.warning("Failed to parse out the Memory config from the shape %s", definition.type)
                 if parts_num > 3:
                     try:
                         shape_config["nvmes"] = int(parts[3])
-                    except (ValueError, IndexError):
+                    except ValueError, IndexError:
                         LOGGER.warning("Failed to parse out the NVMe config from the shape %s", definition.type)
             elif "Dense" in shape_type:
                 # NOTE: Dense shapes with local NVMe disks
@@ -236,6 +288,7 @@ class VirtualMachineProvider:
         return CreateVnicDetails(
             subnet_id=subnet_id,
             assign_public_ip=definition.use_public_ip,
+            assign_ipv6_ip=True,
             assign_private_dns_record=True,
             hostname_label=build_hostname_label(definition.name, "node"),
             display_name=definition.name,
@@ -295,7 +348,9 @@ class VirtualMachineProvider:
             "compartment_id": self._compartment_id,
             "availability_domain": self._get_availability_domain(definition),
             "display_name": definition.name,
-            "image_id": definition.image_id,
+            "source_details": build_image_source_details(
+                image_id=definition.image_id, root_disk_size_gb=definition.root_disk_size, name=definition.name
+            ),
             "shape": shape_type,
             "shape_config": shape_config_obj,
             "create_vnic_details": self._build_primary_vnic_details(
@@ -538,3 +593,108 @@ class VirtualMachineProvider:
             self._compute_client.instance_action(inst.id, action)
             if wait:
                 self._wait_for_state(inst.id, Instance.LIFECYCLE_STATE_RUNNING)
+
+    def attach_secondary_vnics(
+        self,
+        oci_region: OciRegion,
+        name_or_id: str,
+        nic_count: int,
+        display_name_prefix: str,
+        nsg_id: str,
+    ) -> None:
+        """Attach secondary VNICs (nic_index 1..nic_count-1) to an existing instance.
+
+        Each secondary VNIC is placed in a separate private subnet identified by nic_index.
+        """
+        instance = self._resolve_instance(name_or_id)
+        if not instance:
+            raise ProvisionError(f"Instance '{name_or_id}' not found for attaching secondary VNICs")
+
+        existing_attachments = self.get_vnic_attachments(instance.id)
+        existing_display_names = {a.display_name for a in existing_attachments}
+
+        for nic_index in range(1, nic_count):
+            vnic_display_name = f"{display_name_prefix}-nic{nic_index}"
+            if vnic_display_name in existing_display_names:
+                LOGGER.debug("Secondary VNIC '%s' already attached to '%s'", vnic_display_name, name_or_id)
+                continue
+
+            subnet = oci_region.subnet(public=False, nic_index=nic_index)
+            if not subnet:
+                subnet = oci_region.create_subnet(public=False, nic_index=nic_index)
+            if not subnet:
+                raise ProvisionError(
+                    f"Failed to find/create private subnet for nic_index={nic_index} in region '{oci_region.region_name}'"
+                )
+
+            hostname_label = build_hostname_label(vnic_display_name, "nic")
+            LOGGER.info(
+                "Attaching secondary VNIC (nic_index=%d) to instance '%s' in subnet '%s'",
+                nic_index,
+                name_or_id,
+                subnet.display_name,
+            )
+            attach_details = AttachVnicDetails(
+                instance_id=instance.id,
+                create_vnic_details=CreateVnicDetails(
+                    subnet_id=subnet.id,
+                    assign_public_ip=False,
+                    assign_ipv6_ip=True,
+                    assign_private_dns_record=True,
+                    hostname_label=hostname_label,
+                    display_name=vnic_display_name,
+                    nsg_ids=[nsg_id],
+                ),
+                display_name=vnic_display_name,
+                # nic_index is only valid for bare-metal shapes with multiple physical NICs
+                **({"nic_index": nic_index} if instance.shape.startswith("BM.") else {}),
+            )
+            response = self._compute_client.attach_vnic(attach_details)
+            # Wait for the VNIC attachment to reach ATTACHED state
+            oci.wait_until(
+                self._compute_client,
+                self._compute_client.get_vnic_attachment(response.data.id),
+                "lifecycle_state",
+                "ATTACHED",
+                max_wait_seconds=300,
+            )
+            LOGGER.info("Secondary VNIC (nic_index=%d) attached to '%s'", nic_index, name_or_id)
+
+    def get_vnic_attachments(self, instance_id: str) -> list:
+        """Get all VNIC attachments for an instance, sorted by nic_index."""
+        attachments = oci.pagination.list_call_get_all_results(
+            self._compute_client.list_vnic_attachments,
+            compartment_id=self._compartment_id,
+            instance_id=instance_id,
+        ).data
+        active = [a for a in attachments if a.lifecycle_state == "ATTACHED"]
+        active.sort(key=lambda a: a.nic_index or 0)
+        return active
+
+    def get_vnic_details(self, vnic_id: str):
+        """Get VNIC details (IP addresses, hostname, etc.)."""
+        return self._network_client.get_vnic(vnic_id).data
+
+    def get_vnic_ipv6_addresses(self, vnic_id: str) -> list[str]:
+        """Get IPv6 addresses assigned to a VNIC via OCI API."""
+        try:
+            ipv6s = oci.pagination.list_call_get_all_results(
+                self._network_client.list_ipv6s,
+                vnic_id=vnic_id,
+            ).data
+            return [ipv6.ip_address for ipv6 in ipv6s if ipv6.ip_address]
+        except oci.exceptions.ServiceError:
+            return []
+
+    def get_vnic_private_dns_name(self, vnic_id: str) -> str:
+        """Build OCI private FQDN from a specific VNIC."""
+        vnic = self._network_client.get_vnic(vnic_id).data
+        if not (hostname_label := vnic.hostname_label):
+            return ""
+        subnet = self._network_client.get_subnet(vnic.subnet_id).data
+        if not (subnet_dns_label := subnet.dns_label):
+            return ""
+        vcn = self._network_client.get_vcn(subnet.vcn_id).data
+        if not (vcn_dns_label := vcn.dns_label):
+            return ""
+        return f"{hostname_label}.{subnet_dns_label}.{vcn_dns_label}.oraclevcn.com"

@@ -15,16 +15,18 @@ import logging
 import os
 import unittest.mock
 from collections import namedtuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
 
-from sdcm import sct_config
+from sdcm.sct_config import config as sct_config
 from sdcm.keystore import KeyStore
 from sdcm.provision.aws.capacity_errors import RegionAMINotFoundError
 from sdcm.test_config import TestConfig
 from sdcm.utils.common import get_latest_scylla_release
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _get_latest_scylla_release(product="scylla"):
@@ -66,7 +68,7 @@ def fixture_env(monkeypatch):
 
 
 def test_01_dump_config(conf):
-    logging.debug(conf.dump_config())
+    LOGGER.debug(conf.dump_config())
 
 
 def test_02_verify_config(conf):
@@ -117,6 +119,33 @@ def test_08_baremetal(monkeypatch):
     conf.verify_configuration()
     assert "db_nodes_private_ip" in conf.dump_config()
     assert conf.db_nodes_private_ip == ["1.2.3.4", "1.2.3.5"]
+
+
+def test_08_baremetal_requires_version_source(monkeypatch):
+    monkeypatch.delenv("SCT_SCYLLA_VERSION")
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "baremetal")
+    monkeypatch.setenv("SCT_DB_NODES_PRIVATE_IP", '["1.2.3.4", "1.2.3.5"]')
+    monkeypatch.setenv("SCT_DB_NODES_PUBLIC_IP", '["1.2.3.4", "1.2.3.5"]')
+    monkeypatch.setenv("SCT_USE_PREINSTALLED_SCYLLA", "false")
+    monkeypatch.setenv("SCT_S3_BAREMETAL_CONFIG", "some_config")
+    conf = sct_config.SCTConfiguration()
+
+    with pytest.raises(AssertionError, match="SCT_SCYLLA_REPO"):
+        conf.verify_configuration()
+
+
+def test_08_baremetal_with_scylla_repo(monkeypatch):
+    monkeypatch.delenv("SCT_SCYLLA_VERSION")
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "baremetal")
+    monkeypatch.setenv("SCT_DB_NODES_PRIVATE_IP", '["1.2.3.4", "1.2.3.5"]')
+    monkeypatch.setenv("SCT_DB_NODES_PUBLIC_IP", '["1.2.3.4", "1.2.3.5"]')
+    monkeypatch.setenv("SCT_USE_PREINSTALLED_SCYLLA", "false")
+    monkeypatch.setenv("SCT_S3_BAREMETAL_CONFIG", "some_config")
+    monkeypatch.setenv(
+        "SCT_SCYLLA_REPO", "https://s3.amazonaws.com/downloads.scylladb.com/rpm/centos/scylla-2025.3.repo"
+    )
+    conf = sct_config.SCTConfiguration()
+    conf.verify_configuration()
 
 
 def test_09_unknown_configure(monkeypatch):
@@ -421,6 +450,27 @@ def test_15b_image_id_by_scylla_version(monkeypatch):
         conf._get_target_upgrade_version()
 
     assert conf.gce_image_db == resolved_image_link
+
+
+def test_15c_image_id_by_scylla_version_branched_not_found_raises_value_error(monkeypatch):
+    # regression test: get_branched_gce_images() raises AssertionError (not IndexError) when no
+    # images match, since it asserts internally on an empty list before any [0] indexing happens.
+    # SCTConfiguration must translate that into a clean ValueError, not let AssertionError escape.
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "gce")
+    _set_gce_instance_types(monkeypatch)
+    monkeypatch.setenv("SCT_SCYLLA_VERSION", "master:latest")
+    monkeypatch.setenv("SCT_USER_PREFIX", "testing")
+    monkeypatch.setenv("SCT_GCE_IMAGE_DB", "")
+    monkeypatch.setenv("SCT_USE_PREINSTALLED_SCYLLA", "true")
+
+    with unittest.mock.patch.object(
+        sct_config,
+        "get_branched_gce_images",
+        side_effect=AssertionError("GCE images for scylla_version='master:latest' not found"),
+        clear=True,
+    ):
+        with pytest.raises(ValueError, match="GCE image for scylla_version='master:latest' was not found"):
+            sct_config.SCTConfiguration()
 
 
 def test_17_verify_scylla_bench_required_parameters_in_command(monkeypatch):
@@ -733,6 +783,18 @@ def test_36_update_config_based_on_version():
     conf.update_config_based_on_version()
 
 
+def test_36a_scale_tests_disable_region_fallback(monkeypatch):
+    # SCT-779: relocating a very large scale-test cluster across regions can exceed the fixed
+    # Jenkins "Provision Resources" stage timeout, leaving in-flight Spot Fleet Requests
+    # uncancelled. Scale tests must not attempt cross-region relocation.
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "aws")
+    monkeypatch.setenv("SCT_AMI_ID_DB_SCYLLA", "ami-dummy")
+    monkeypatch.setenv("SCT_CONFIG_FILES", "test-cases/scale/scale-cluster.yaml")
+    monkeypatch.setenv("SCT_USE_MGMT", "false")
+    conf = sct_config.SCTConfiguration()
+    assert conf.get("fallback_to_next_region") is False
+
+
 def test_37_validates_single_thread_count_for_all_throttle_steps(monkeypatch):
     monkeypatch.setenv("SCT_PERF_GRADUAL_THREADS", '{"read": 620, "write": [630], "mixed": [500]}')
     monkeypatch.setenv(
@@ -911,7 +973,7 @@ def test_vector_store_ami_name_resolved_to_ami_id(monkeypatch):
             return f"ami-{param}"
         return param
 
-    with unittest.mock.patch("sdcm.sct_config.convert_name_to_ami_if_needed", side_effect=fake_convert):
+    with unittest.mock.patch("sdcm.sct_config.config.convert_name_to_ami_if_needed", side_effect=fake_convert):
         sct_config.SCTConfiguration()
 
     assert "vector-store-1-5-0-arm64-2026-03-17t07-07-32z" in resolved_names, (
@@ -979,7 +1041,7 @@ def test_resolve_amis_reresolves_name_intent_via_convert(monkeypatch):
     conf._ami_params_snapshot = {"ami_id_loader": "resolve:ssm:/some/loader/path"}
     conf["ami_id_loader"] = "ami-loader-east"
 
-    with patch("sdcm.sct_config.convert_name_to_ami_if_needed", return_value="ami-loader-west") as mock_convert:
+    with patch("sdcm.sct_config.config.convert_name_to_ami_if_needed", return_value="ami-loader-west") as mock_convert:
         conf.resolve_amis(["eu-west-1"], source_region="us-east-1")
 
     mock_convert.assert_called_once_with("resolve:ssm:/some/loader/path", ("eu-west-1",))
@@ -992,7 +1054,7 @@ def test_resolve_amis_remaps_explicit_ami_via_find_equivalent(monkeypatch):
     conf["ami_id_db_scylla"] = "ami-source-scylla"
 
     with patch(
-        "sdcm.sct_config.find_equivalent_ami",
+        "sdcm.sct_config.config.find_equivalent_ami",
         return_value=[{"region": "eu-west-1", "ami_id": "ami-target-scylla"}],
     ) as mock_equiv:
         conf.resolve_amis(["eu-west-1"], source_region="us-east-1")
@@ -1006,7 +1068,7 @@ def test_resolve_amis_raises_region_ineligible_when_no_equivalent(monkeypatch):
     conf._ami_params_snapshot = {"ami_id_db_scylla": "ami-source-scylla"}
     conf["ami_id_db_scylla"] = "ami-source-scylla"
 
-    with patch("sdcm.sct_config.find_equivalent_ami", return_value=[]):
+    with patch("sdcm.sct_config.config.find_equivalent_ami", return_value=[]):
         with pytest.raises(RegionAMINotFoundError):
             conf.resolve_amis(["eu-west-1"], source_region="us-east-1")
 
@@ -1075,7 +1137,7 @@ def test_overlay_beats_env_when_test_id_matches(monkeypatch, placement_logdir): 
 
     # relocation re-resolves region-bound AMIs; ami-dummy is explicit so it goes through find_equivalent_ami
     with patch(
-        "sdcm.sct_config.find_equivalent_ami",
+        "sdcm.sct_config.config.find_equivalent_ami",
         return_value=[{"region": "eu-west-1", "ami_id": "ami-dummy-west"}],
     ):
         conf = sct_config.SCTConfiguration()
@@ -1100,7 +1162,7 @@ def test_resolved_placement_with_amis_applies_directly_and_skips_re_resolution(m
     )
 
     with patch(
-        "sdcm.sct_config.find_equivalent_ami",
+        "sdcm.sct_config.config.find_equivalent_ami",
         return_value=[{"region": "eu-west-1", "ami_id": "ami-reresolved"}],
     ):
         conf = sct_config.SCTConfiguration()
@@ -1495,3 +1557,374 @@ def test_nvme_self_test_type_env_override(monkeypatch):
     monkeypatch.setenv("SCT_NVME_SELF_TEST_TYPE", "2")
     conf = sct_config.SCTConfiguration()
     assert conf.get("nvme_self_test_type") == 2
+
+
+def _fake_oracle_conf(params: dict, region_names=None):
+    conf = MagicMock()
+    conf.get.side_effect = params.get
+    conf.region_names = region_names or []
+    return conf
+
+
+def test_aws_oracle_image_resolver_joins_amis_per_region():
+    conf = _fake_oracle_conf({"instance_type_db_oracle": "i4i.large"}, region_names=["us-east-1", "eu-west-1"])
+    ami = MagicMock()
+    ami.image_id = "ami-fake"
+    with (
+        patch.object(sct_config, "get_arch_from_instance_type", return_value="x86_64"),
+        patch.object(sct_config, "get_scylla_ami_versions", return_value=[ami]),
+    ):
+        result = sct_config._resolve_oracle_images_aws(conf, "2026.1")
+
+    assert result == "ami-fake ami-fake"
+
+
+def test_oci_oracle_image_resolver_joins_image_ocids_per_region():
+    conf = _fake_oracle_conf({"oci_region_name": ["us-phoenix-1", "us-ashburn-1"]})
+    fake_image = ["OCI", "fake-name", "ocid1.image.fake"]
+    with patch.object(sct_config.oci_utils, "get_scylla_images_by_version", return_value=[fake_image]):
+        result = sct_config._resolve_oracle_images_oci(conf, "2026.2.0")
+
+    assert result == "ocid1.image.fake ocid1.image.fake"
+
+
+def test_gce_oracle_image_resolver_returns_global_self_link():
+    # gce images are global: a single self_link, not per-region values
+    conf = _fake_oracle_conf({})
+    gce_image = MagicMock()
+    gce_image.name = "scylla-enterprise-2026-1-0"
+    gce_image.self_link = "https://www.googleapis.com/compute/v1/projects/scylla-images/global/images/fake"
+    with patch.object(sct_config, "get_scylla_gce_images_versions", return_value=[gce_image]):
+        result = sct_config._resolve_oracle_images_gce(conf, "2026.1")
+
+    assert result == gce_image.self_link
+
+
+def test_azure_oracle_image_resolver_joins_image_ids_per_region():
+    conf = _fake_oracle_conf(
+        {"azure_region_name": ["eastus", "westus2"], "azure_instance_type_db_oracle": "Standard_L8s_v3"}
+    )
+    azure_image = MagicMock()
+    azure_image.name = "fake-image"
+    azure_image.id = "/communityGalleries/fake/images/scylla/versions/2026.1.0"
+    with (
+        patch.object(
+            sct_config.azure_utils,
+            "get_arch_from_azure_instance_type",
+            return_value=sct_config.azure_utils.VmArch.X86,
+        ),
+        patch.object(sct_config.azure_utils, "get_released_scylla_images", return_value=[azure_image]),
+    ):
+        result = sct_config._resolve_oracle_images_azure(conf, "2026.1")
+
+    assert result == f"{azure_image.id} {azure_image.id}"
+
+
+@pytest.mark.parametrize(
+    "db_type,expected_len",
+    [
+        ("scylla", 33),  # 35 - 2 (azure)
+        ("mixed_scylla", 26),  # 35 - 2 (azure) - 7 (oracle suffix)
+    ],
+)
+def test_mixed_scylla_run_reserves_user_prefix_room_for_oracle_suffix(monkeypatch, db_type, expected_len):
+    """the oracle node prefix is user_prefix + '-oracle', so mixed runs must cap
+    user_prefix 7 chars shorter to keep node names inside the platform limits"""
+    user_prefix = "longevity-5gb-1h-ToggleAuditRulesNemesisSyslog"
+    env = {
+        "SCT_CLUSTER_BACKEND": "azure",
+        "SCT_USER_PREFIX": user_prefix,
+        "SCT_AZURE_REGION_NAME": "eastus",
+        "SCT_AZURE_IMAGE_DB": "/fake/image/db",
+        "SCT_AZURE_INSTANCE_TYPE_DB": "Standard_L8s_v3",
+        "SCT_DB_TYPE": db_type,
+        "SCT_N_TEST_ORACLE_DB_NODES": "1",
+        "SCT_AMI_ID_DB_SCYLLA_DESC": "unit",
+        # the oracle image is given explicitly, so version resolution stays off (no Azure calls)
+        "SCT_ORACLE_SCYLLA_VERSION": "",
+        "SCT_AZURE_IMAGE_DB_ORACLE": "/fake/image/db-oracle",
+        "SCT_AZURE_INSTANCE_TYPE_DB_ORACLE": "Standard_L8s_v3",
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    conf = sct_config.SCTConfiguration()
+    conf.verify_configuration()
+
+    assert conf.user_prefix == user_prefix[:expected_len]
+
+
+@pytest.mark.parametrize(
+    "backend, use_prepared_loaders",
+    [
+        pytest.param("k8s-eks", False, id="k8s-backend"),
+        pytest.param("aws", True, id="prepared-loaders"),
+    ],
+)
+def test_cs_safepoint_logging_rejected_without_cs_docker_container(monkeypatch, backend, use_prepared_loaders):
+    """JVM_OPTS is only injected into the c-s docker container, so the flag would silently do nothing."""
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", backend)
+    monkeypatch.setenv("SCT_AMI_ID_DB_SCYLLA", "ami-dummy")
+    monkeypatch.setenv("SCT_USE_PREPARED_LOADERS", str(use_prepared_loaders))
+    monkeypatch.setenv("SCT_CS_SAFEPOINT_LOGGING", "true")
+
+    conf = sct_config.SCTConfiguration()
+
+    with pytest.raises(ValueError, match="cs_safepoint_logging"):
+        conf._verify_cs_safepoint_logging(backend)
+
+
+def test_cs_safepoint_logging_allowed_on_docker_based_loaders(monkeypatch):
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "aws")
+    monkeypatch.setenv("SCT_AMI_ID_DB_SCYLLA", "ami-dummy")
+    monkeypatch.setenv("SCT_CS_SAFEPOINT_LOGGING", "true")
+
+    conf = sct_config.SCTConfiguration()
+
+    conf._verify_cs_safepoint_logging("aws")
+
+
+# ---------------------------------------------------------------------------
+# scylla_network_config validation (SCTConfiguration step 17)
+#
+# These pin every rule in the step-17 block so it can be refactored into a
+# per-backend rule table without changing behaviour. Three of the configs below
+# have been sitting unused in unit_tests/test_configs/ since PR #6575 added
+# them; the tests that referenced them were lost along the way.
+# ---------------------------------------------------------------------------
+
+_AWS_NETWORK_CONFIG_ENV = {
+    "SCT_CLUSTER_BACKEND": "aws",
+    "SCT_AMI_ID_DB_SCYLLA": "ami-dummy",
+    "SCT_INSTANCE_TYPE_DB": "i4i.large",
+}
+
+_GCE_NETWORK_CONFIG_ENV = {
+    "SCT_CLUSTER_BACKEND": "gce",
+    "SCT_GCE_DATACENTER": "us-east1",
+    "SCT_GCE_INSTANCE_TYPE_DB": "n2-highmem-2",
+    "SCT_GCE_IMAGE_DB": (
+        "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-stream-9"
+    ),
+    "SCT_SCYLLA_VERSION": "5.4.0",
+}
+
+
+_OCI_NETWORK_CONFIG_ENV = {
+    "SCT_CLUSTER_BACKEND": "oci",
+    "SCT_OCI_REGION_NAME": "us-phoenix-1",
+    "SCT_OCI_IMAGE_DB": "ocid1.image.oc1.phx.dummy",
+}
+
+
+def _setup_network_config_env(monkeypatch, base_env, config_files):
+    """Point SCTConfiguration at `config_files` on the given backend.
+
+    The step-17 checks run inside SCTConfiguration.__init__, but image resolution runs first and
+    would reach out to the cloud, so it is stubbed here. `scylla_network_config` is a plain list
+    field with no string coercion, so it can only be supplied through a config file, never through
+    an SCT_* environment variable.
+    """
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SCT_USE_MGMT", "false")
+    monkeypatch.setenv("SCT_CONFIG_FILES", config_files)
+    monkeypatch.setattr(sct_config, "convert_name_to_ami_if_needed", lambda value, region_names: value)
+    monkeypatch.setattr(
+        sct_config,
+        "get_scylla_gce_images_versions",
+        lambda version: [MagicMock(self_link="fake-link", name="scylla-5-4-0")],
+    )
+    monkeypatch.setattr(sct_config, "get_branch_version", lambda *args, **kwargs: "5.4.0")
+
+
+def test_scylla_network_config_missing_address_raises(monkeypatch):
+    """Every one of the five addresses is mandatory; rpc_address is absent from this config."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_interface_not_defined.yaml",
+    )
+
+    with pytest.raises(ValueError, match="Interface address\\(es\\) were not defined: rpc_address"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_missing_mandatory_param_raises(monkeypatch):
+    """'public' is mandatory per address, and the first address in this config omits it."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_interface_param_not_defined.yaml",
+    )
+
+    with pytest.raises(ValueError, match="'public' parameter value for first address is not defined"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_missing_mandatory_param_on_fourth_address_raises(monkeypatch):
+    """A missing parameter past the third address reports the address, not a bare KeyError.
+
+    scylla_network_config configures five addresses, so this is where a typo is most likely to
+    land, and it used to be the one spot that produced no usable message at all.
+    """
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_param_missing_on_fourth_address.yaml",
+    )
+
+    with pytest.raises(ValueError, match="'public' parameter value for fourth address is not defined"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_public_ipv4_on_secondary_nic_raises_on_aws(monkeypatch):
+    """A public IPv4 has to sit on nic 0: EC2 only associates one on device index 0."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_interface_param_public_not_primary.yaml",
+    )
+
+    with pytest.raises(ValueError, match="it has to be primary network interface"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_public_ipv4_on_secondary_nic_raises_on_gce(monkeypatch):
+    """The public-IPv4-on-nic-0 rule is backend-independent today.
+
+    It is worded after the EC2 limitation, but GCE relies on it too: build_network_interfaces()
+    in sdcm/provision/gce/instance_provider.py only attaches an AccessConfig to nic 0. Pinned here
+    so extracting a per-backend rule table does not silently drop it for GCE.
+    """
+    _setup_network_config_env(
+        monkeypatch,
+        _GCE_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_interface_param_public_not_primary.yaml",
+    )
+
+    with pytest.raises(ValueError, match="it has to be primary network interface"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_use_dns_on_secondary_nic_raises_on_gce(monkeypatch):
+    """GCE publishes a private DNS record for nic 0 only, so use_dns on nic 1 is rejected."""
+    _setup_network_config_env(
+        monkeypatch,
+        _GCE_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_use_dns_on_secondary_nic.yaml",
+    )
+
+    with pytest.raises(ValueError, match="GCE creates a private DNS record for the primary network interface only"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_use_dns_on_secondary_nic_accepted_on_aws(monkeypatch):
+    """The use_dns rule is GCE-only: the same config is valid on AWS."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        "unit_tests/test_configs/network_config_use_dns_on_secondary_nic.yaml",
+    )
+
+    conf = sct_config.SCTConfiguration()
+
+    assert [address["nic"] for address in conf.scylla_network_config if address["address"] == "rpc_address"] == [1]
+
+
+def test_scylla_network_config_ipv6_raises_on_gce(monkeypatch):
+    """GCE has no IPv6 provisioning, so an ipv6 address is rejected at config time.
+
+    Without this the run got as far as resolving the address, where
+    ScyllaNetworkConfiguration.get_ip_by_address_config() returned None and the failure surfaced
+    far from the config that caused it.
+    """
+    _setup_network_config_env(
+        monkeypatch,
+        _GCE_NETWORK_CONFIG_ENV,
+        '["unit_tests/test_configs/minimal_test_case.yaml", '
+        '"configurations/network_config/all_addresses_ipv6_public.yaml"]',
+    )
+
+    with pytest.raises(ValueError, match="'ip_type: ipv6' is set for 'listen_address'"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_ipv6_accepted_on_oci(monkeypatch):
+    """The ipv6 guard is GCE-only: OCI implements IPv6 and must keep accepting the same config."""
+    _setup_network_config_env(
+        monkeypatch,
+        _OCI_NETWORK_CONFIG_ENV,
+        '["unit_tests/test_configs/minimal_test_case.yaml", '
+        '"configurations/network_config/all_addresses_ipv6_public.yaml"]',
+    )
+
+    conf = sct_config.SCTConfiguration()
+
+    assert {address["ip_type"] for address in conf.scylla_network_config} == {"ipv6"}
+
+
+def test_scylla_network_config_multiple_nics_multi_region_raises(monkeypatch):
+    """Secondary interfaces live in a per-region subnet, so multi-NIC multi-region is rejected."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV | {"SCT_AMI_ID_DB_SCYLLA": "ami-dummy ami-dummy2"},
+        '["unit_tests/test_configs/minimal_test_case.yaml", "configurations/network_config/two_interfaces.yaml"]',
+    )
+    monkeypatch.setenv("SCT_REGION_NAME", '["eu-west-1", "us-east-1"]')
+    monkeypatch.setenv("SCT_N_DB_NODES", "2 2")
+
+    with pytest.raises(ValueError, match="Multiple network interfaces aren't supported for multi region use cases"):
+        sct_config.SCTConfiguration()
+
+
+def test_scylla_network_config_multiple_nics_single_region_accepted(monkeypatch):
+    """Positive control for the rules above: two interfaces in one region is a valid config."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV,
+        '["unit_tests/test_configs/minimal_test_case.yaml", "configurations/network_config/two_interfaces.yaml"]',
+    )
+
+    conf = sct_config.SCTConfiguration()
+
+    assert {address["nic"] for address in conf.scylla_network_config} == {0, 1}
+
+
+def test_use_dns_names_aws_multi_dc_raises(monkeypatch):
+    """EC2 private DNS names do not resolve across regions, so AWS multi-DC with DNS names is rejected."""
+    _setup_network_config_env(
+        monkeypatch,
+        _AWS_NETWORK_CONFIG_ENV | {"SCT_AMI_ID_DB_SCYLLA": "ami-dummy ami-dummy2"},
+        "unit_tests/test_configs/minimal_test_case.yaml",
+    )
+    monkeypatch.setenv("SCT_REGION_NAME", '["eu-west-1", "us-east-1"]')
+    monkeypatch.setenv("SCT_N_DB_NODES", "2 2")
+    monkeypatch.setenv("SCT_USE_DNS_NAMES", "true")
+
+    with pytest.raises(ValueError, match="use_dns_names is not supported for AWS multi-DC tests"):
+        sct_config.SCTConfiguration()
+
+
+def test_use_dns_names_aws_single_dc_accepted(monkeypatch):
+    """Positive control: a single AWS region keeps accepting use_dns_names."""
+    _setup_network_config_env(monkeypatch, _AWS_NETWORK_CONFIG_ENV, "unit_tests/test_configs/minimal_test_case.yaml")
+    monkeypatch.setenv("SCT_USE_DNS_NAMES", "true")
+
+    conf = sct_config.SCTConfiguration()
+
+    assert conf.get("use_dns_names") is True
+
+
+def test_use_dns_names_gce_multi_dc_accepted(monkeypatch):
+    """The multi-DC guard is AWS-only; GCE internal DNS is project-wide."""
+    _setup_network_config_env(
+        monkeypatch,
+        _GCE_NETWORK_CONFIG_ENV | {"SCT_GCE_DATACENTER": "us-east1 us-west1"},
+        "unit_tests/test_configs/minimal_test_case.yaml",
+    )
+    monkeypatch.setenv("SCT_N_DB_NODES", "2 2")
+    monkeypatch.setenv("SCT_USE_DNS_NAMES", "true")
+
+    conf = sct_config.SCTConfiguration()
+
+    assert conf.gce_datacenters == ["us-east1", "us-west1"]

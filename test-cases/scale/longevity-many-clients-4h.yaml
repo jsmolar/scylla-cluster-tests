@@ -1,3 +1,21 @@
+test_metadata:
+  description: >-
+    Client-scale test: 50 loaders open 500 connections per host each against a 6-node i4i.metal
+    cluster spread over 50 keyspaces, running cassandra-stress write and read streams for 4 hours
+    under SisyphusMonkey. Exercises connection handling and per-client overhead rather than data
+    volume.
+  test_type: scale
+  tier: tier2
+  duration_class: medium
+  supported_backends:
+    - aws
+  stress_tools:
+    - cassandra-stress
+  workload: mixed
+  nemesis_labels:
+    - SisyphusMonkey
+  team_ownership: core-test-infra
+
 test_duration: 420
 
 prepare_write_cmd:  "cassandra-stress write cl=QUORUM n=20971520 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate threads=100 -pop seq=1..20971520 -col 'n=FIXED(2) size=FIXED(256)' -log interval=5"
@@ -9,9 +27,15 @@ stress_cmd: ["cassandra-stress write cl=QUORUM duration=240m -schema 'replicatio
 n_db_nodes: 6
 n_loaders: 50
 
-instance_type_db: 'i4i.metal'
-instance_type_loader: 'c7i.large'
-instance_type_monitor: 'm6i.2xlarge'
+sizing_db:  # halved per soyacz: cluster load was ~30% at the original size (PR #15847 review)
+  vcpu: 64
+  memory: '>=512'
+sizing_loader:
+  vcpu: 2
+  memory: '>=4'
+sizing_monitor:
+  vcpu: 8
+  memory: '>=32'
 nemesis_class_name: 'SisyphusMonkey'
 nemesis_seed: '031'
 seeds_num: 3

@@ -8,9 +8,10 @@ from dataclasses import dataclass, replace
 from typing import List, Union
 
 from performance_regression_test import PerformanceRegressionTest
-from sdcm.utils.common import skip_optional_stage
+from sdcm.stress.latte_thread import find_latte_fn_names
 from sdcm.sct_events import Severity
 from sdcm.sct_events.system import TestFrameworkEvent
+from sdcm.utils.common import skip_optional_stage
 from sdcm.utils.decorators import latency_calculator_decorator
 from sdcm.utils.latency import calculate_latency, analyze_hdr_percentiles
 
@@ -370,6 +371,63 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             self.log.info("Schema has been prepared")
             self.run_post_prepare_cql(workload=workload)
 
+    @staticmethod
+    def _aggregate_ops_rate(results: list, num_loaders: int, num_commands: int) -> float:
+        # round-robin: 1 cmd/loader, so sum == avg×loaders; additive: distinct cmds, so multiply by loaders.
+        if not results:
+            return 0.0
+
+        def _op_rate(result):
+            try:
+                return float(result.get("op rate", 0) or 0)
+            except TypeError, ValueError:
+                return 0.0
+
+        total = sum(_op_rate(r) for r in results)
+        return total if num_commands == num_loaders else total * num_loaders
+
+    def test_dual_engine_mixed_gradual_increase_load(self):
+        """Run logstor (60%) and LSM (40%) Latte workloads together as one mixed workload.
+
+        All four commands (logstor_write, logstor_read, lsm_write, lsm_read) run
+        concurrently within the same gradual step, so what is measured is the combined
+        60/40 distribution across both storage engines.  Argus reports one latency row
+        per HDR tag (fn--logstor_write, fn--logstor_read, fn--lsm_write, fn--lsm_read)
+        plus a summary row for the distribution as a whole.
+
+        Test flow:
+        1. Populate both tables (500M rows each, CL=ALL).  Both tables are created by the
+           auto-schema call inside LatteStressThread.build_stress_cmd, which passes
+           latte_schema_parameters (both engines' keyspace/table names) to 'latte schema'.
+        2. Wait for compactions to quiesce.
+        3. Run the mixed (write:30/read:70) gradual-throughput steps; per-engine rates are
+           baked into each command via $logstor_write_rate / $lsm_read_rate / ... .
+
+        Required config keys (provided by logstor_lsm_dual_60_40.yaml):
+          stress_cmd_m - all four commands,
+          perf_gradual_throttle_steps.dual_engine_mixed,
+          perf_gradual_step_duration.dual_engine_mixed
+        """
+        workload_type = "dual_engine_mixed"
+        # Each engine has its own keyspace/table, so there is no single "test table" here.
+        # test_keyspace/test_table stay empty: they only feed drop_keyspace (disabled) and
+        # run_post_prepare_cql (no post_prepare_cql_cmds in this config).
+        workload = Workload(
+            workload_type=workload_type,
+            cs_cmd_tmpl=self.params.get("stress_cmd_m"),
+            cs_cmd_warm_up=None,
+            num_threads=self.get_num_threads_for_workload(workload_type),
+            throttle_steps=self.throttle_steps(workload_type),
+            preload_data=True,
+            drop_keyspace=False,
+            wait_no_compactions=True,
+            step_duration=self.step_duration(workload_type),
+            prepare_schema=False,
+        )
+        self._base_test_workflow(
+            workload=workload, test_name="test_dual_engine_mixed_gradual_increase_load (logstor 60% / lsm 40%)"
+        )
+
     def check_latency_during_steps(self, step):
         with open(self.latency_results_file, encoding="utf-8") as file:
             latency_results = json.load(file)
@@ -388,14 +446,18 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             return latency_results
         return {step: {"step": step, "legend": "", "cycles": []}}
 
-    def run_step(self, stress_cmds, step_params, step_duration):
+    def run_step(self, stress_cmds, step_params, step_duration, hdr_tags=None):
         """
         Run a single stress step with parameters from step_params dict.
 
         Args:
-            stress_cmds: List of stress command templates
-            step_params: Dict with step parameters (threads, concurrency, rate, throttle)
+            stress_cmds:   List of stress command templates
+            step_params:   Dict with step parameters (threads, concurrency, rate, throttle)
             step_duration: Duration for this step
+            hdr_tags:      Optional explicit list of HDR tag strings.  When provided,
+                           latency_calculator_decorator uses it directly so that all
+                           function tags (write + read) are reported rather than only
+                           the first queue's tags.  Pass None to use auto-detection.
         """
         results = []
         stress_queue = []
@@ -404,12 +466,8 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             stress_cmd_to_run = stress_cmd
 
             # Replace placeholders from step_params dict
-            if "threads" in step_params:
-                stress_cmd_to_run = stress_cmd_to_run.replace("$threads", str(step_params["threads"]))
-            if "concurrency" in step_params:
-                stress_cmd_to_run = stress_cmd_to_run.replace("$concurrency", str(step_params["concurrency"]))
-            if "throttle" in step_params:
-                stress_cmd_to_run = stress_cmd_to_run.replace("$throttle", step_params["throttle"])
+            for param_name, param_value in sorted(step_params.items(), key=lambda item: len(item[0]), reverse=True):
+                stress_cmd_to_run = stress_cmd_to_run.replace(f"${param_name}", str(param_value))
             if step_duration is not None:
                 # For latte, --duration accepts an integer iteration count (number of cycles to run)
                 # rather than a time string like cassandra-stress
@@ -559,13 +617,20 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             step_params["throttle"] = self.current_throttle(
                 throttle_step_dict, num_loaders, stress_num, workload.cs_cmd_tmpl[0]
             )
+            step_duration = throttle_step_dict.get("duration", workload.step_duration)
 
             self.log.info(
-                "Run cs command with rate: %s Kops; threads: %s; step name: %s",
+                "Run cs command with rate: %s Kops; threads: %s; step name: %s; duration: %s",
                 throttle_step_dict.get("rate", "unthrottled"),
                 step_params["threads"],
                 current_throttle_step,
+                step_duration,
             )
+            # Pre-compute flattened HDR tags from command templates so both write
+            # and read tags are passed explicitly to the decorator.  This prevents
+            # _find_hdr_tags from stopping at the first queue and omitting the read tag.
+            step_hdr_tags = [f"fn--{fn}" for cmd in workload.cs_cmd_tmpl for fn in find_latte_fn_names(cmd)]
+
             run_step = (
                 latency_calculator_decorator(
                     legend=f"Gradual test step {current_throttle_step} op/s", cycle_name=current_throttle_step
@@ -574,20 +639,22 @@ class PerformanceRegressionPredefinedStepsTest(PerformanceRegressionTest):
             results, _ = run_step(
                 stress_cmds=workload.cs_cmd_tmpl,
                 step_params=step_params,
-                step_duration=workload.step_duration,
+                step_duration=step_duration,
+                hdr_tags=step_hdr_tags or None,
             )
             self.log.debug("All c-s commands results collected and saved in Argus")
 
-            calculate_result = self._calculate_average_max_latency(results)
             summary_result = self.check_latency_during_steps(step=current_throttle_step)
-            summary_result[current_throttle_step].update({"ops_rate": calculate_result["op rate"] * num_loaders})
+            summary_result[current_throttle_step].update(
+                {"ops_rate": self._aggregate_ops_rate(results, num_loaders, len(workload.cs_cmd_tmpl))}
+            )
             total_summary.update(summary_result)
             if workload.drop_keyspace:
                 self.drop_keyspace(keyspace_name=workload.test_keyspace)
             # We want 3 minutes (180 sec) wait between steps.
             # In case of "mixed" workflow - wait for compactions finished.
             # In case of "read" workflow -  it just will wait for 3 minutes
-            if workload.wait_no_compactions:
+            if throttle_step_dict.get("wait_no_compactions", workload.wait_no_compactions):
                 if (wait_time := self.wait_no_compactions_running()[0]) < 180:
                     time.sleep(180 - wait_time)
                 self.log.info("All compactions are finished")

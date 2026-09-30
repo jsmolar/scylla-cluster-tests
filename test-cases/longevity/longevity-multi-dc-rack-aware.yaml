@@ -1,3 +1,23 @@
+test_metadata:
+  description: >-
+    12-hour rack-aware multi-DC longevity test: two 3-node DCs with real (not simulated) racks,
+    cassandra-stress write and read streams at LOCAL_QUORUM from rack-aware and region-aware loaders,
+    under SisyphusMonkey. The baseline rack-aware soak.
+  test_type: longevity
+  tier: tier1
+  duration_class: medium
+  supported_backends:
+    - aws
+  stress_tools:
+    - cassandra-stress
+  workload: mixed
+  nemesis_labels:
+    - SisyphusMonkey
+  features:
+    - multi-dc
+    - rack-aware
+  team_ownership: core-test-infra
+
 test_duration: 800
 
 prepare_write_cmd:  ["cassandra-stress write cl=LOCAL_QUORUM n=20971520 -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -port jmx=6868 -mode cql3 native -rate threads=80 -pop seq=1..20971520 -col 'n=FIXED(10) size=FIXED(512)' -log interval=5",
@@ -13,7 +33,9 @@ rack_aware_loader: true
 region_aware_loader: true
 simulated_racks: 0
 
-instance_type_db: 'i4i.2xlarge'
+sizing_db:  # no OCI match (DenseIO min 16 vCPUs)
+  vcpu: 8
+  memory: '>=64'
 
 nemesis_class_name: 'SisyphusMonkey'
 nemesis_interval: 10

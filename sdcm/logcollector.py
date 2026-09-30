@@ -57,6 +57,7 @@ from sdcm.utils.common import (
     search_test_id_in_latest,
     filter_aws_instances_by_type,
     filter_gce_instances_by_type,
+    gce_meta_to_dict,
     get_sct_root_path,
     normalize_ipv6_url,
     create_remote_storage_dir,
@@ -65,6 +66,7 @@ from sdcm.utils.parallel_object import ParallelObject
 from sdcm.utils.context_managers import environment
 from sdcm.utils.distro import Distro
 from sdcm.utils.decorators import retrying
+from sdcm.utils.grafana_api import GRAFANA_ANNOTATIONS_API_PATH, GRAFANA_SEARCH_API_PATH
 from sdcm.utils.docker_utils import get_docker_bridge_gateway
 from sdcm.utils.k8s import KubernetesOps
 from sdcm.utils.s3_remote_uploader import upload_remote_files_directly_to_s3
@@ -505,7 +507,7 @@ class MonitoringStack(BaseMonitoringEntity):
     def get_grafana_annotations(self, grafana_ip: str) -> str:
         try:
             session = _create_retry_session()
-            res = session.get(f"http://{grafana_ip}:{self.grafana_port}/api/annotations")
+            res = session.get(f"http://{grafana_ip}:{self.grafana_port}" + GRAFANA_ANNOTATIONS_API_PATH)
             if res.ok:
                 return res.text
         except Exception as details:  # noqa: BLE001
@@ -515,7 +517,7 @@ class MonitoringStack(BaseMonitoringEntity):
     @staticmethod
     @retrying(n=3, sleep_time=3, message="Search dashboard...", raise_on_exceeded=False)
     def search_dashboard(grafana_ip: str, port: int, query: str) -> list:
-        search_api_url = f"http://{grafana_ip}:{port}/api/search?query={query}"
+        search_api_url = f"http://{grafana_ip}:{port}" + GRAFANA_SEARCH_API_PATH + f"?query={query}"
         session = _create_retry_session()
         resp = session.get(search_api_url)
         if not resp.ok:
@@ -744,7 +746,7 @@ class LogCollector:
                 node.remoter.run(collect_log_command, ignore_status=True, verbose=True)
                 result = node.remoter.run(f"test -f '{log_filename}'", ignore_status=True)
                 ok = result.ok
-            except (Libssh2_Failure, InvokeFailure):
+            except Libssh2_Failure, InvokeFailure:
                 ssh_connected = False
 
         # Check if node is AWS-based
@@ -908,8 +910,7 @@ class ScyllaLogCollector(LogCollector):
             name="system.log",
             command="sudo journalctl --no-tail --no-pager -u scylla-ami-setup.service "
             "-u scylla-image-setup.service -u scylla-io-setup.service -u scylla-server.service "
-            "-u scylla-jmx.service -u scylla-housekeeping-restart.service "
-            "-u scylla-housekeeping-daily.service -o short-precise",
+            "-u scylla-jmx.service -o short-precise",
             search_locally=True,
         ),
         FileLog(name="console_output.log", search_locally=True),
@@ -934,6 +935,24 @@ class ScyllaLogCollector(LogCollector):
         CommandLog(name="coredumps.info", command="sudo coredumpctl info"),
         CommandLog(name="io-properties.yaml", command="cat /etc/scylla.d/io_properties.yaml"),
         CommandLog(name="dmesg.log", command="sudo dmesg -P"),
+        # a node which is up locally but unreachable for its peers and loaders (SCT-479) can
+        # only be diagnosed with the netfilter rules and the routing state of the node at hand
+        CommandLog(
+            name="network_state.log",
+            command=(
+                "( echo '=== iptables-save ==='; sudo iptables-save; "
+                "echo '=== ip6tables-save ==='; sudo ip6tables-save; "
+                # the iptables wrappers do not show the rules written natively through nft
+                "echo '=== nft list ruleset ==='; sudo nft list ruleset; "
+                "echo '=== listening sockets ==='; sudo ss -ltnp; "
+                "echo '=== addresses ==='; ip -d addr; "
+                "echo '=== routes ==='; ip route; ip -6 route; "
+                "echo '=== routing rules ==='; ip rule; ip -6 rule; "
+                "echo '=== neighbours ==='; ip neigh; "
+                "echo '=== firewall services ==='; sudo systemctl status --full --no-pager "
+                "netfilter-persistent nftables firewalld iptables ufw )"
+            ),
+        ),
         CommandLog(name="systemctl.status", command="sudo systemctl status --all --full --no-pager"),
         # system.log here filters to scylla units only, so capture vector.dev's status/journal/config separately
         CommandLog(
@@ -988,6 +1007,10 @@ class ScyllaLogCollector(LogCollector):
         ),
         CommandLog(
             name="nvme_self_test_log.log",
+            # Reading log page 06h from a controller that does not implement
+            # Device Self-test is rejected, and the rejected command is recorded
+            # in the device Error Information Log. Gate the read on OACS bit 4
+            # so collection does not leave errors behind on AWS Nitro SSDs.
             command=(
                 "( command -v nvme > /dev/null 2>&1 && "
                 "for dev in $(sudo nvme list -o json 2>/dev/null "
@@ -997,7 +1020,12 @@ class ScyllaLogCollector(LogCollector):
                 "[print(ns.get('DevicePath',ns.get('device',ns.get('NameSpace','')))) "
                 "for item in devs "
                 "for ns in (item.get('Namespaces',[item]) if isinstance(item,dict) and 'Namespaces' in item else [item])]"
-                '" 2>/dev/null); do echo "=== $dev ==="; sudo nvme self-test-log $dev 2>&1; done '
+                '" 2>/dev/null); do echo "=== $dev ==="; '
+                "if sudo nvme id-ctrl $dev -o json 2>/dev/null "
+                '| python3 -c "import sys,json; '
+                "sys.exit(0 if json.load(sys.stdin).get('oacs',0) & 16 else 1)"
+                '" 2>/dev/null; then sudo nvme self-test-log $dev 2>&1; '
+                'else echo "device self-test not supported by controller (OACS bit 4 clear)"; fi; done '
                 "|| true )"
             ),
         ),
@@ -1164,6 +1192,7 @@ class LoaderLogCollector(LogCollector):
         FileLog(name="kcl-l*.log", search_locally=True),
         FileLog(name="*cassandra-harry*.log", search_locally=True),
         FileLog(name="hdrh-*.hdr", search_locally=True),
+        FileLog(name="cs-safepoint-*.log", search_locally=True),
         FileLog(name="*latte*", search_locally=True),
         FileLog(
             name="test.crt",
@@ -1279,10 +1308,20 @@ class BaseSCTLogCollector(LogCollector):
         FileLog(name="junit.xml", search_locally=True),
         FileLog(name="cdc-replicator.log", search_locally=True),
         FileLog(name="minicloud.log", search_locally=True),
+        # the complete container log, pulled at collection time. minicloud.log above is the
+        # manager's streamed copy and always stops where its streamer was killed, so this is
+        # the only one carrying the teardown ending
+        FileLog(name="minicloud-teardown.log", search_locally=True),
         # the emulator's crash evidence: stderr and the (credential-redacted) container
         # state snapshot carrying the exit code and OOMKilled flag
         FileLog(name="minicloud-stderr.log", search_locally=True),
         FileLog(name="minicloud-inspect.json", search_locally=True),
+        # each emulated guest's serial console — the only view inside a node SCT never
+        # managed to SSH into, where every per-node archive comes back empty
+        FileLog(name="minicloud-serial-*.log", search_locally=True),
+        # hydra's builder <-> runner transport watchdog samples (SCT-1044). The runner appends one
+        # sample every few minutes. The console gets only the anomalous ones and a periodic sample.
+        FileLog(name="hydra-watchdog.log", search_locally=True),
     ]
     cluster_log_type = "sct-runner-events"
     cluster_dir_prefix = "sct-runner-events"
@@ -1849,7 +1888,7 @@ class Collector:
                     global_ip=self.get_gce_ip_address(instance),
                     tags={
                         **self.tags,
-                        "NodeType": "scylla-db",
+                        "NodeType": gce_meta_to_dict(instance.metadata).get("NodeType", "scylla-db"),
                     },
                 )
             )
@@ -1910,7 +1949,14 @@ class Collector:
     def create_collecting_nodes(self):
         try:
             provisioners = provisioner_factory.discover_provisioners(backend=self.backend, test_id=self.test_id)
-            instances = sum([provisioner.list_instances() for provisioner in provisioners], [])
+            # NOTE: discovered provisioners may report overlapping sets of instances, i.e. when there is
+            #       one provisioner per availability zone of the same region. Collecting one node more
+            #       than once makes the parallel collectors race for the same remote archive paths and
+            #       corrupt them, so keep a single entry per instance name.
+            instances = {}
+            for provisioner in provisioners:
+                for instance in provisioner.list_instances():
+                    instances.setdefault(instance.name, instance)
             collecting_nodes = [
                 CollectingNode(
                     name=instance.name,
@@ -1923,7 +1969,7 @@ class Collector:
                     global_ip=instance.public_ip_address,
                     tags=instance.tags,
                 )
-                for instance in instances
+                for instance in instances.values()
             ]
             for c_node in collecting_nodes:
                 match c_node.tags.get("NodeType"):

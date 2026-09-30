@@ -69,7 +69,7 @@ _MACHINE_TYPE_PARAM_GATES: tuple[tuple[str, Callable[[object], bool]], ...] = (
     ("gce_instance_type_loader", _has_loaders),
     ("gce_instance_type_monitor", _has_monitor),
     ("zero_token_instance_type_db", _has_zero_token),
-    ("instance_type_db_oracle", _has_oracle),
+    ("gce_instance_type_db_oracle", _has_oracle),
     ("instance_type_db_target", _always),
     ("nemesis_grow_shrink_instance_type", _always),
     ("instance_type_vector_store", _has_vector_store),
@@ -101,7 +101,9 @@ class GceAZResolver:
         If `pre_filter_unavailable_availability_zones` is False, returns without
         modifying params. Multi-AZ configs ("b,c,d") have invalid zones replaced with
         valid alternatives in the same region.
-        Raises `NoValidAvailabilityZoneError` when no zone letter is valid in every region.
+        Raises `NoValidAvailabilityZoneError` when no zone letter is valid in every region, or
+        when fewer zones are valid than the configuration asks for - the zone count sets
+        `racks_count`, so returning fewer would silently change the cluster topology.
         """
         if not self._params.get("pre_filter_unavailable_availability_zones"):
             LOGGER.info("Upfront zone filter disabled; skipping GceAZResolver.resolve()")
@@ -141,6 +143,20 @@ class GceAZResolver:
                 break
             if letter not in resolved:
                 resolved.append(letter)
+
+        if len(resolved) < len(configured_letters):
+            # `availability_zone: 'b,c,d'` asks for three racks, one per zone. Handing back two
+            # would silently build a two-rack cluster - `racks_count` is derived from this very
+            # parameter - so the test would run a topology it never asked for. Dropping a rack is
+            # the job's decision, not the resolver's. `get_region_fallback_candidates` already
+            # holds a region to the configured zone count; `resolve` is held to the same rule.
+            raise NoValidAvailabilityZoneError(
+                f"availability_zone '{','.join(configured_letters)}' requests "
+                f"{len(configured_letters)} zone(s), but only {len(resolved)} "
+                f"('{','.join(resolved)}') support all required machine types {machine_types} "
+                f"in every region of {region_names}. Reduce availability_zone, drop a region, "
+                f"or use machine types available in more zones."
+            )
 
         new_value = ",".join(resolved)
         original_value = self._params.get("availability_zone")

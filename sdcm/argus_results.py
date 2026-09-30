@@ -211,9 +211,11 @@ class MigratorBenchmarkResult(StaticGenericResultTable):
         ]
 
 
-class PerfSimpleQueryResult(StaticGenericResultTable):
-    def __init__(self, workload: str, parameters: dict):
-        super().__init__(name=f"{workload} - Perf Simple Query", description=json.dumps(parameters))
+class MicrobenchmarkResult(StaticGenericResultTable):
+    # benchmark_name defaults to "Perf Simple Query" so that the perf-simple-query tables keep the
+    # name they have always had in Argus, and with it their history.
+    def __init__(self, workload: str, parameters: dict, benchmark_name: str = "Perf Simple Query"):
+        super().__init__(name=f"{workload} - {benchmark_name}", description=json.dumps(parameters))
 
     class Meta:
         Columns = [
@@ -356,7 +358,7 @@ def send_result_to_argus(  # noqa: PLR0914
     skip_hdr_tag = hdr_summary_len == 1 or (workload == "mixed" and hdr_summary_len == 2)
     for i, (workload_type_and_hdr_tag, hdr_data) in enumerate(hdr_summary.items()):
         (workload_type, hdr_tag) = workload_type_and_hdr_tag.split("--", maxsplit=1)
-        row_name = f"{cycle}" + "" if skip_hdr_tag else f" (HDR tag: {hdr_tag})"
+        row_name = cycle if skip_hdr_tag else f"{cycle} (HDR tag: {hdr_tag})"
         for percentile in ("90", "99"):
             if (workload_type, percentile) not in summary_worst_lat:
                 summary_worst_lat[(workload_type, percentile)] = 0.0
@@ -428,7 +430,9 @@ def send_result_to_argus(  # noqa: PLR0914
         submit_results_to_argus(argus_client, result_table)
 
 
-def send_perf_simple_query_result_to_argus(argus_client: ArgusClient, result: dict, error_thresholds: dict):
+def send_microbenchmark_result_to_argus(
+    argus_client: ArgusClient, result: dict, error_thresholds: dict, benchmark_name: str = "Perf Simple Query"
+):
     def set_validation_rules(column_metadata):
         if column_threshold := error_thresholds.get(workload, {}).get(column_metadata, {}):
             LOGGER.debug("%s_threshold result: %s", column_metadata, column_threshold)
@@ -442,7 +446,9 @@ def send_perf_simple_query_result_to_argus(argus_client: ArgusClient, result: di
     validation_rules["instructions_per_op"] = set_validation_rules("instructions_per_op")
     validation_rules["allocs_per_op"] = set_validation_rules("allocs_per_op")
 
-    result_table = PerfSimpleQueryResult(workload=workload, parameters=result["parameters"])
+    result_table = MicrobenchmarkResult(
+        workload=workload, parameters=result["parameters"], benchmark_name=benchmark_name
+    )
     result_table.validation_rules = validation_rules
     LOGGER.debug("result_table.validation_rules result: %s", result_table.validation_rules)
     for key, value in stats.items():

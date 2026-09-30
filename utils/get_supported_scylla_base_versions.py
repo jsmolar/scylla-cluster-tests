@@ -39,9 +39,12 @@ start_support_versions = {
 }
 start_support_backend = {"azure": {"scylla": "5.2", "enterprise": "2023.1"}}
 
-# list of version that are available, but aren't supported, and we should test upgrades from
+# list of versions that are available, but aren't supported, and we shouldn't test upgrades from
 unsupported_versions = [
     "5.3",
+    # images of this release have a baked-in unstable repo snapshot which was already pruned from S3,
+    # so the rollback step of the rolling upgrade test can't reinstall it back (SCYLLADB-3508)
+    "2025.2",
 ]
 
 
@@ -59,7 +62,7 @@ class UpgradeBaseVersion:
         if len(linux_distro.split("-")) > 1:
             self.dist_type, *_, self.dist_version = linux_distro.split("-")
         else:
-            self.dist_type = linux_distro.split("-")[0]
+            self.dist_type = linux_distro.split("-", maxsplit=1)[0]
             self.dist_version = None
         self.scylla_repo = scylla_repo
         self.linux_distro = linux_distro
@@ -240,7 +243,7 @@ class UpgradeBaseVersion:
         base_version_list = sorted(list(set(base_version_list)), key=ComparableScyllaVersion)
         try:
             filter_rc = [v for v in get_all_versions(self.repo_maps[base_version_list[-1]]) if "rc" not in v]
-        except (ValueError, ParallelObjectException):
+        except ValueError, ParallelObjectException:
             # Repository for this version doesn't exist yet (e.g. new release announced
             # but no rc0 packages published). Treat it as unavailable and skip it.
             LOGGER.warning("Skipping version %s: repository doesn't fully exist yet", base_version_list[-1])

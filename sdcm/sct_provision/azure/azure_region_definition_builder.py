@@ -12,6 +12,7 @@
 # Copyright (c) 2022 ScyllaDB
 from typing import Any, Dict
 
+from sdcm.provision.azure.utils import azure_provisioner_config
 from sdcm.sct_provision.common.types import NodeTypeType
 from sdcm.sct_provision.region_definition_builder import ConfigParamsMap, DefinitionBuilder
 
@@ -36,7 +37,15 @@ monitor_map = ConfigParamsMap(
     root_disk_size="root_disk_size_monitor",
 )
 
-mapper: Dict[NodeTypeType, ConfigParamsMap] = {"scylla-db": db_map, "loader": loader_map, "monitor": monitor_map}
+mapper: Dict[NodeTypeType, ConfigParamsMap] = {
+    "scylla-db": db_map,
+    "oracle-db": db_map.derive(
+        image_id="azure_image_db_oracle",
+        type="azure_instance_type_db_oracle",
+    ),
+    "loader": loader_map,
+    "monitor": monitor_map,
+}
 
 
 class AzureDefinitionBuilder(DefinitionBuilder):
@@ -54,9 +63,5 @@ class AzureDefinitionBuilder(DefinitionBuilder):
         return f"{node_prefix}-{region}-{index}".lower()
 
     def get_provisioner_config(self) -> Dict[str, Any]:
-        """Pass Azure stuck-VM timeout and recreate-attempt settings to the provisioner."""
-        return {
-            "azure_provision_stuck_vm_timeout": self.params.get("azure_provision_stuck_vm_timeout"),
-            "azure_provision_stuck_vm_recreate_attempts": self.params.get("azure_provision_stuck_vm_recreate_attempts"),
-            "azure_provision_stuck_vm_total_timeout": self.params.get("azure_provision_stuck_vm_total_timeout"),
-        }
+        """Pass the stuck-VM settings and the network interface layout to the provisioner."""
+        return azure_provisioner_config(self.params)

@@ -1,10 +1,36 @@
+test_metadata:
+  description: >-
+    Schema-scale test that pairs every one of 5000 tablet-enabled tables with collocated and
+    non-collocated materialized views: latte creates the schema, populates it and then runs a
+    validated write/read mix plus dedicated MV read streams for 7 hours on a 6-node cluster. The
+    heaviest schema-scale variant - 5000 tables and 5000 views at once.
+  test_type: scale
+  tier: tier2
+  duration_class: medium
+  supported_backends:
+    - aws
+  stress_tools:
+    - latte
+  workload: mixed
+  nemesis_labels:
+    - SisyphusMonkey
+  features:
+    - tablets
+  team_ownership: core-test-infra
+
 test_duration: 1060 # ~3h prepare schema + 3h of prepare data+ 7h mixed/MV reads + 4h margin
 prepare_stress_duration: 360
 
 n_db_nodes: 6
-instance_type_db: 'i4i.4xlarge'
+sizing_db:
+  vcpu: 16
+  # OCI DenseIO.E5 at 16 vCPUs provides only 96 GB (12 GB/OCPU fixed ratio).
+  # Lowered from >=128 to >=96 so OCI can match; other clouds still pick >=128 naturally.
+  memory: '>=96'
 n_loaders: 1
-instance_type_loader: 'c6i.4xlarge'
+sizing_loader:
+  vcpu: 16
+  memory: '>=32'
 
 user_prefix: 'schema-scale-5000t-5000mv'
 append_scylla_yaml:

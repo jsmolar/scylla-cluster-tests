@@ -48,6 +48,7 @@ from argus.common.enums import TestStatus
 from sdcm import nemesis, cluster_docker, cluster_k8s, cluster_baremetal, wait
 from sdcm.cloud_api_client import ScyllaCloudAPIClient
 from sdcm.provision.azure.kms_provider import AzureKmsProvider
+from sdcm.provision.azure.utils import azure_provisioner_config
 from sdcm.provision.gce.kms_provider import GcpKmsProvider
 from sdcm.provision.gce.zone_resolver import GceAZResolver
 from sdcm.cluster import (
@@ -83,6 +84,11 @@ from sdcm.provision.aws.az_resolver import (
     run_pre_flight_capacity_probe,
 )
 from sdcm.provision.common.fallback import is_az_fallback_enabled, is_region_fallback_enabled
+from sdcm.provision.common.oracle import (
+    ORACLE_IMAGE_PARAMS,
+    ORACLE_INSTANCE_TYPE_PARAMS,
+    ORACLE_USER_PREFIX_SUFFIX,
+)
 from sdcm.provision.aws.capacity_errors import ProvisioningCapacityExhausted, RegionAMINotFoundError, is_capacity_error
 from sdcm.provision.aws.capacity_reservation import SCTCapacityReservation
 from sdcm.provision.aws.region_fallback import (
@@ -249,6 +255,9 @@ except ImportError:
 
 
 TEST_LOG = logging.getLogger(__name__)
+
+# timeout for the full scylla-doctor collection during failure handling
+SCYLLA_DOCTOR_TEARDOWN_TIMEOUT = 30 * 60
 
 PYTHON_THREAD_LIST = (KafkaCDCReaderThread, KafkaProducerThread, KafkaValidatorThread)
 
@@ -789,8 +798,10 @@ class ClusterTester(unittest.TestCase):
                     "gemini_version": gemini_version,
                     "gemini_write_errors": results.get("write_errors", -1),
                     "gemini_write_ops": results.get("write_ops", -1),
-                    "oracle_node_ami_id": self.params.get("ami_id_db_oracle"),
-                    "oracle_node_instance_type": self.params.get("instance_type_db_oracle"),
+                    "oracle_node_ami_id": self.params.get(ORACLE_IMAGE_PARAMS.get(self.params.get("cluster_backend"))),
+                    "oracle_node_instance_type": self.params.get(
+                        ORACLE_INSTANCE_TYPE_PARAMS.get(self.params.get("cluster_backend"))
+                    ),
                     "oracle_node_scylla_version": self.cs_db_cluster.params.artifact_scylla_version
                     if self.cs_db_cluster
                     else "N/A",
@@ -1058,16 +1069,16 @@ class ClusterTester(unittest.TestCase):
 
     def prepare_kms_host(self) -> None:  # noqa: PLR0911
         if self.params.get("cluster_backend") != "aws":
-            logging.debug("Skip configuring AWS KMS, test is not running on AWS")
+            TEST_LOG.debug("Skip configuring AWS KMS, test is not running on AWS")
             return
         if not self.params.is_enterprise:
-            logging.debug("Skip configuring AWS KMS, not running enterprise version")
+            TEST_LOG.debug("Skip configuring AWS KMS, not running enterprise version")
             return
         if ComparableScyllaVersion(self.params.artifact_scylla_version) < "2023.1.3":
-            logging.debug("Skip configuring AWS KMS, version does not support KMS")
+            TEST_LOG.debug("Skip configuring AWS KMS, version does not support KMS")
             return
         if self.params.get("enterprise_disable_kms"):
-            logging.debug("Skip configuring AWS KMS, `enterprise_disable_kms` is set in the config")
+            TEST_LOG.debug("Skip configuring AWS KMS, `enterprise_disable_kms` is set in the config")
             return
         # NOTE: KMS is a Scylla-only, enterprise feature. In mixed_scylla/mixed_cassandra setups
         # (e.g. gemini), it is configured for the tested Scylla cluster only; the Oracle cluster is
@@ -1075,7 +1086,7 @@ class ClusterTester(unittest.TestCase):
         # The tested cluster is already gated as enterprise above, so we no longer skip mixed tests.
 
         if not (scylla_encryption_options := self.params.get("scylla_encryption_options")):
-            logging.debug(
+            TEST_LOG.debug(
                 "Configuring AWS KMS: `scylla_encryption_options` is not set in the config, using default values"
             )
             self.params["scylla_encryption_options"] = (
@@ -1122,18 +1133,18 @@ class ClusterTester(unittest.TestCase):
 
     def prepare_azure_kms(self) -> None:  # noqa: PLR0911
         if self.params.get("cluster_backend") != "azure":
-            logging.debug("Skip configuring Azure KMS, test is not running on Azure")
+            TEST_LOG.debug("Skip configuring Azure KMS, test is not running on Azure")
             return
         if self.params.get("enterprise_disable_kms"):
-            logging.debug("Skip configuring Azure KMS, `enterprise_disable_kms` is set in the config")
+            TEST_LOG.debug("Skip configuring Azure KMS, `enterprise_disable_kms` is set in the config")
             return
         if self.params.get("db_type") in ("mixed_scylla", "mixed_cassandra"):
-            logging.debug("Skip configuring Azure KMS, test uses mixed cluster versions")
+            TEST_LOG.debug("Skip configuring Azure KMS, test uses mixed cluster versions")
             return
         try:
             scylla_version = ComparableScyllaVersion(self.params.artifact_scylla_version)
             if not (scylla_version >= "2025.4.0~dev"):
-                logging.debug(f"Skip configuring Azure KMS, Scylla version {scylla_version} does not support KMS")
+                TEST_LOG.debug(f"Skip configuring Azure KMS, Scylla version {scylla_version} does not support KMS")
                 return
         except ValueError as e:
             InfoEvent(
@@ -1142,7 +1153,7 @@ class ClusterTester(unittest.TestCase):
             ).publish()
 
         if not (scylla_encryption_options := self.params.get("scylla_encryption_options")):
-            logging.debug(
+            TEST_LOG.debug(
                 "Configuring Azure KMS:`scylla_encryption_options` is not set in the config, using default values"
             )
             self.params["scylla_encryption_options"] = (
@@ -1181,17 +1192,17 @@ class ClusterTester(unittest.TestCase):
 
     def prepare_gcp_kms(self) -> None:  # noqa: PLR0911
         if self.params.get("cluster_backend") != "gce":
-            logging.debug("Skip configuring GCP KMS, test is not running on GCE")
+            TEST_LOG.debug("Skip configuring GCP KMS, test is not running on GCE")
             return
         if self.params.get("enterprise_disable_kms"):
-            logging.debug("Skip configuring GCP KMS, `enterprise_disable_kms` is set in the config")
+            TEST_LOG.debug("Skip configuring GCP KMS, `enterprise_disable_kms` is set in the config")
             return
         if self.params.get("db_type") in ("mixed_scylla", "mixed_cassandra"):
-            logging.debug("Skip configuring GCP KMS, test uses mixed cluster versions")
+            TEST_LOG.debug("Skip configuring GCP KMS, test uses mixed cluster versions")
             return
 
         if not (scylla_encryption_options := self.params.get("scylla_encryption_options")):
-            logging.debug(
+            TEST_LOG.debug(
                 "Configuring GCP KMS: `scylla_encryption_options` is not set in the config, using default values"
             )
             self.params["scylla_encryption_options"] = (
@@ -1780,6 +1791,20 @@ class ClusterTester(unittest.TestCase):
         else:
             self.monitors = NoMonitorSet()
 
+        if db_type == "mixed_scylla":
+            self.cs_db_cluster = self._create_oracle_cluster(
+                ScyllaGCECluster,
+                common_params,
+                user_prefix,
+                gce_image=self.params.get("gce_image_db_oracle"),
+                gce_image_type=self.params.get("gce_root_disk_type_db"),
+                gce_image_size=db_info.get("disk_size") or self.params.get("root_disk_size_db"),
+                gce_instance_type=self.params.get("gce_instance_type_db_oracle"),
+                gce_n_local_ssd=self.params.get("gce_n_local_ssd_disk_db"),
+                add_disks=cluster_additional_disks,
+                provisioners=provisioners,
+            )
+
     def get_cluster_azure(self, loader_info, db_info, monitor_info):
         regions = self.params.get("azure_region_name")
         test_id = str(TestConfig().test_id())
@@ -1791,11 +1816,7 @@ class ClusterTester(unittest.TestCase):
                     test_id=test_id,
                     region=region,
                     availability_zone=self.params.get("availability_zone"),
-                    azure_provision_stuck_vm_timeout=self.params.get("azure_provision_stuck_vm_timeout"),
-                    azure_provision_stuck_vm_recreate_attempts=self.params.get(
-                        "azure_provision_stuck_vm_recreate_attempts"
-                    ),
-                    azure_provision_stuck_vm_total_timeout=self.params.get("azure_provision_stuck_vm_total_timeout"),
+                    **azure_provisioner_config(self.params),
                 )
             )
         if db_info["n_nodes"] is None:
@@ -1849,6 +1870,33 @@ class ClusterTester(unittest.TestCase):
             )
         else:
             self.monitors = NoMonitorSet()
+
+        db_type = self.params.get("db_type")
+        if db_type == "mixed_scylla":
+            self.cs_db_cluster = self._create_oracle_cluster(
+                ScyllaAzureCluster,
+                common_params,
+                user_prefix,
+                image_id=self.params.get("azure_image_db_oracle"),
+                root_disk_size=db_info["disk_size"],
+                instance_type=self.params.get("azure_instance_type_db_oracle"),
+                provisioners=provisioners,
+                user_name=self.params.get("azure_image_username"),
+            )
+
+    def _create_oracle_cluster(self, cluster_class, common_params: dict, user_prefix: str, **backend_kwargs):
+        """Create the oracle cluster used when db_type is mixed_scylla."""
+        self.test_config.mixed_cluster(True)
+
+        oracle_user_prefix = user_prefix + ORACLE_USER_PREFIX_SUFFIX
+        cluster_params = common_params | {"user_prefix": oracle_user_prefix}
+
+        return cluster_class(
+            n_nodes=self.params.get("n_test_oracle_db_nodes"),
+            node_type="oracle-db",
+            **backend_kwargs,
+            **cluster_params,
+        )
 
     def get_cluster_oci(self, loader_info, db_info, monitor_info):
         regions = self.params.get("oci_region_name")
@@ -1917,17 +1965,15 @@ class ClusterTester(unittest.TestCase):
 
         db_type = self.params.get("db_type")
         if db_type == "mixed_scylla":
-            self.test_config.mixed_cluster(True)
-            oracle_image = self.params.get("oci_image_db_oracle") or oci_image
-            self.cs_db_cluster = ScyllaOciCluster(
-                image_id=oracle_image,
+            self.cs_db_cluster = self._create_oracle_cluster(
+                ScyllaOciCluster,
+                common_params,
+                user_prefix,
+                image_id=self.params.get("oci_image_db_oracle"),
                 root_disk_size=db_info["disk_size"],
                 instance_type=self.params.get("oci_instance_type_db_oracle"),
                 provisioners=provisioners,
-                n_nodes=self.params.get("n_test_oracle_db_nodes"),
                 user_name=self.params.get("oci_image_username"),
-                node_type="oracle-db",
-                **(common_params | {"user_prefix": user_prefix + "-oracle"}),
             )
 
     def get_cluster_aws(self, loader_info, db_info, monitor_info):
@@ -2191,15 +2237,14 @@ class ClusterTester(unittest.TestCase):
                     **(common_params | {"user_prefix": user_prefix + "-cassandra-oracle"}),
                 )
             elif db_type == "mixed_scylla":
-                self.test_config.mixed_cluster(True)
-                return ScyllaAWSCluster(
+                return self._create_oracle_cluster(
+                    ScyllaAWSCluster,
+                    common_params,
+                    user_prefix,
                     ec2_ami_id=self.params.get("ami_id_db_oracle").split(),
                     ec2_ami_username=self.params.get("ami_db_scylla_user"),
                     ec2_instance_type=self.params.get("instance_type_db_oracle"),
                     ec2_block_device_mappings=db_info["device_mappings"],
-                    n_nodes=self.params.get("n_test_oracle_db_nodes"),
-                    node_type="oracle-db",
-                    **(common_params | {"user_prefix": user_prefix + "-oracle"}),
                 )
             elif db_type == "cloud_scylla":
                 cloud_credentials = self.params.get("cloud_credentials_path")
@@ -3024,6 +3069,14 @@ class ClusterTester(unittest.TestCase):
         elif stress_cmd.startswith("nosqlbench"):
             params["stop_test_on_failure"] = stop_test_on_failure
             return self.run_nosqlbench_thread(**params)
+        elif stress_cmd.startswith("gemini"):
+            return self.run_gemini(
+                cmd=stress_cmd.removeprefix("gemini").strip(),
+                duration=duration,
+                stress_num=stress_num,
+                round_robin=round_robin,
+                stop_test_on_failure=stop_test_on_failure,
+            )
         elif stress_cmd.startswith("table_compare"):
             return self.run_table_compare_thread(**params)
         elif stress_cmd.startswith("python_thread"):
@@ -3315,7 +3368,7 @@ class ClusterTester(unittest.TestCase):
             params=self.params,
         ).run()
 
-    def run_gemini(self, cmd, duration=None):
+    def run_gemini(self, cmd, duration=None, stress_num=1, round_robin=False, stop_test_on_failure=True, **_):
         if duration:
             timeout = self.get_duration(duration)
         elif self._stress_duration:
@@ -3323,6 +3376,7 @@ class ClusterTester(unittest.TestCase):
             cmd = apply_gemini_stress_duration(cmd, self._stress_duration)
         else:
             timeout = get_timeout_from_stress_cmd(cmd) or self.get_duration(duration)
+        stop_test_on_failure = False if not self.params.get("stop_test_on_stress_failure") else stop_test_on_failure
         return GeminiStressThread(
             test_cluster=self.db_cluster,
             oracle_cluster=self.cs_db_cluster,
@@ -3330,6 +3384,9 @@ class ClusterTester(unittest.TestCase):
             stress_cmd=cmd,
             timeout=timeout,
             params=self.params,
+            stress_num=stress_num,
+            round_robin=round_robin,
+            stop_test_on_failure=stop_test_on_failure,
         ).run()
 
     def run_python_thread(self, stress_cmd, duration=None, **_):
@@ -4186,15 +4243,26 @@ class ClusterTester(unittest.TestCase):
                 # per node and can take tens of minutes per node, so a serial pass over a large
                 # cluster (e.g. 60 nodes) previously took 40+ minutes. Workers are capped to avoid
                 # spawning an unbounded number of threads/SSH sessions on very large clusters.
-                with ThreadPoolExecutor(max_workers=min(len(ready_nodes), 20)) as executor:
-                    for future in as_completed(
-                        executor.submit(run_scylla_doctor_on_node, node) for node in ready_nodes
-                    ):
+                # Timed out nodes are reported and skipped so tearDown can continue collecting logs
+                executor = ThreadPoolExecutor(max_workers=min(len(ready_nodes), 20))
+                futures = {executor.submit(run_scylla_doctor_on_node, node): node for node in ready_nodes}
+                try:
+                    for future in as_completed(futures, timeout=SCYLLA_DOCTOR_TEARDOWN_TIMEOUT):
                         # run_scylla_doctor_on_node handles its own errors; guard against unexpected ones.
                         try:
                             future.result()
                         except Exception as exc:  # noqa: BLE001
-                            self.log.warning("Unexpected error running scylla-doctor on a node: %s", exc)
+                            self.log.warning(
+                                "Unexpected error running scylla-doctor on node %s: %s", futures[future].name, exc
+                            )
+                except TimeoutError:
+                    self.log.warning(
+                        "scylla-doctor did not finish within %s seconds on nodes %s, giving up on them",
+                        SCYLLA_DOCTOR_TEARDOWN_TIMEOUT,
+                        [node.name for future, node in futures.items() if not future.done()],
+                    )
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("Unexpected error when collecting scylla-doctor info: %s", exc)
 
@@ -4335,9 +4403,9 @@ class ClusterTester(unittest.TestCase):
 
         self._check_alive_routines_and_report_them()
         self._check_if_db_log_time_consistency_looks_good()
-        logging.debug("Threads and processes at the end of the test:")
+        TEST_LOG.debug("Threads and processes at the end of the test:")
         for t in threading.enumerate():
-            logging.debug(f"Active thread: {t.name} (id={t.ident}, daemon={t.daemon}, repr={t!r})")
+            TEST_LOG.debug(f"Active thread: {t.name} (id={t.ident}, daemon={t.daemon}, repr={t!r})")
 
     @silence()
     def _check_if_db_log_time_consistency_looks_good(self):
@@ -4348,9 +4416,9 @@ class ClusterTester(unittest.TestCase):
                 looks_good = False
                 break
         if looks_good:
-            logging.info("DB logs time consistency is perfect")
+            TEST_LOG.info("DB logs time consistency is perfect")
         else:
-            logging.error(
+            TEST_LOG.error(
                 "DB logs time consistency is NOT perfect, details:\n%s", yaml.safe_dump(result, sort_keys=False)
             )
 
@@ -4358,7 +4426,7 @@ class ClusterTester(unittest.TestCase):
         threads_alive = self.show_alive_threads()
         processes_alive = self.show_alive_processes()
         if processes_alive or threads_alive:
-            logging.error("Please check %s log to see them", self.left_processes_log)
+            TEST_LOG.error("Please check %s log to see them", self.left_processes_log)
 
     def _get_test_result_event(self) -> TestResultEvent:
         return TestResultEvent(

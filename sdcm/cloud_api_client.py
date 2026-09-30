@@ -174,6 +174,24 @@ class ScyllaCloudAPIClient:
         )
         return {instance["externalId"]: instance["id"] for instance in response["instances"]}
 
+    def get_availability_zones(
+        self, *, cloud_provider_id: int, region_id: int, instance_type_id: int | None = None
+    ) -> list[dict[str, str]]:
+        """
+        Get availability zones of a given cloud provider region, sorted by zone id.
+
+        AWS returns a distinct 'id' ('use1-az1', stable per physical zone) and 'name' ('us-east-1c',
+        an account-specific alias); GCE returns the zone name in both.
+        Passing instance_type_id narrows the list to zones where that instance type can be deployed.
+        """
+        account_id = self.get_current_account_id()
+        cloud_account_id = self.get_cloud_account_id(account_id=account_id, cloud_provider_id=cloud_provider_id)
+        params = {"instanceTypeId": instance_type_id} if instance_type_id else None
+        zones = self.request(
+            "GET", f"/account/{account_id}/cloud-account/{cloud_account_id}/region/{region_id}/zones", params=params
+        )
+        return sorted(zones or [], key=lambda zone: zone["id"])
+
     @cached_property
     def cloud_provider_ids(self) -> dict[CloudProviderType, int]:
         """Get a mapping of cloud provider names to their IDs"""
@@ -216,6 +234,14 @@ class ScyllaCloudAPIClient:
     def get_active_accounts(self, *, account_id: int) -> list[dict[str, Any]]:
         """From given account list active cloud-accounts for all cloud-providers"""
         return self.request("GET", f"/account/{account_id}/cloud-account")
+
+    def get_cloud_account_id(self, *, account_id: int, cloud_provider_id: int) -> int:
+        """Get the ID of the active cloud account tied to a given cloud provider"""
+        for account in self.get_active_accounts(account_id=account_id):
+            if account["cloudProviderId"] == cloud_provider_id and account.get("state") == "ACTIVE":
+                return account["id"]
+
+        raise ScyllaCloudAPIError(f"No active cloud account found for cloud_provider_id: {cloud_provider_id}")
 
     def get_account_details(self) -> dict[str, Any]:
         """Get details of the account tied to the authorized user"""
@@ -264,6 +290,7 @@ class ScyllaCloudAPIClient:
         prom_proxy: bool,
         vector_search: dict | None,
         tablets: str | None,
+        availability_zone_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Create cluster-create request.
@@ -291,9 +318,16 @@ class ScyllaCloudAPIClient:
         :param prom_proxy: whether to enable Prometheus proxy for the cluster (default: False)
         :param vector_search: Vector Search configuration
         :param tablets: tablets configuration, should be set to "enforced" for XCloud cluster
+        :param availability_zone_ids: optional per-node AZ placement. AWS expects AZ IDs
+            (e.g., 'use1-az1'); GCE expects zone names (e.g., 'us-east1-b').
+            Provide one value per node to force placement. Use None to let Scylla Cloud choose placement.
 
         :return: created cluster details
         """
+        # 'placement' is a string enum ("true"/"false"/"") in the API, not a JSON boolean
+        placement_overrides = (
+            {"availabilityZoneIdsOverride": availability_zone_ids, "placement": "true"} if availability_zone_ids else {}
+        )
         response = self.request(
             "POST",
             f"/account/{account_id}/cluster",
@@ -318,6 +352,7 @@ class ScyllaCloudAPIClient:
             promProxy=prom_proxy,
             vectorSearch=vector_search,
             tablets=tablets,
+            **placement_overrides,
         )
         return self._parse_response_data(response)
 
