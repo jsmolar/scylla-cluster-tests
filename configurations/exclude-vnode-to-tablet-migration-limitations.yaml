@@ -1,7 +1,8 @@
 # Nemesis exclusions for vnode-to-tablet migration tests.
 #
 # Every nemesis runs during the migration except the ones that use a feature
-# outside the MS3 scope (SCYLLADB-2455) that is still not supported.
+# outside the MS3 scope (SCYLLADB-2455) that is still not supported, and the ones
+# that take a node down (see the last group).
 # Sources: the MS3 and MS4 (SCYLLADB-775) epics, and the limitations in
 # https://github.com/scylladb/scylladb/blob/master/docs/operating-scylla/procedures/config-change/migrate-vnodes-to-tablets.rst
 # When a feature becomes supported, delete its nemeses.
@@ -24,9 +25,24 @@
 # CDC (SCYLLADB-1166, MS4): CDCStressorMonkey, ToggleCDCMonkey
 # Tablet options on migrating tables (SCYLLADB-2608, MS4): SplitMergeTabletsWithAlter
 # Resharding by restart, not covered by MS3: NodeRestartWithResharding
+#
+# Taking a node down. The migration keeps one node down while it reshards. With RF=3 and
+# one replica per rack, a second node down in another rack leaves some partitions with one
+# replica, and the CL=QUORUM stress fails:
+#   Stop, restart, reboot or kill one node: DrainerMonkey, EndOfQuotaNemesis, EnospcMonkey,
+#     HardRebootNodeMonkey, MultipleHardRebootNodeMonkey, NodeTerminateAndReplace, ScyllaKillMonkey,
+#     SerialRestartOfElectedTopologyCoordinatorNemesis, SoftRebootNodeMonkey, StopStartMonkey,
+#     StopWaitStartMonkey, ValidateHintedHandoffShortDowntime
+#   Make one node unreachable: BlockNetworkMonkey, DisableBinaryGossipExecuteMajorCompaction,
+#     RandomInterruptionNetworkMonkey, RejectInterNodeNetworkMonkey, StopStartInterfacesNetworkMonkey
+#   Restart every node, also the resharding one: ClusterRollingRestart, ClusterRollingRestartRandomOrder,
+#     EnospcAllNodesMonkey, RollingRestartConfigChangeInternodeCompression, SwitchBetweenPasswordAuthAndSaslauthdAuth,
+#     ToggleAuditNemesisSyslog, ToggleAuditRulesNemesisSyslog, ToggleLdapConfiguration
 
 nemesis_class_name: 'SisyphusMonkey'
-nemesis_selector: >-
+nemesis_selector: |-
+  (
+  # Features not supported in MS3
   not AbortDecommissionMonkey
   and not AddRemoveDcNemesis
   and not AddRemoveRackNemesis
@@ -64,3 +80,30 @@ nemesis_selector: >-
   and not ToggleCDCMonkey
   and not SplitMergeTabletsWithAlter
   and not NodeRestartWithResharding
+  # Taking a node down
+  and not DrainerMonkey
+  and not EndOfQuotaNemesis
+  and not EnospcMonkey
+  and not HardRebootNodeMonkey
+  and not MultipleHardRebootNodeMonkey
+  and not NodeTerminateAndReplace
+  and not ScyllaKillMonkey
+  and not SerialRestartOfElectedTopologyCoordinatorNemesis
+  and not SoftRebootNodeMonkey
+  and not StopStartMonkey
+  and not StopWaitStartMonkey
+  and not ValidateHintedHandoffShortDowntime
+  and not BlockNetworkMonkey
+  and not DisableBinaryGossipExecuteMajorCompaction
+  and not RandomInterruptionNetworkMonkey
+  and not RejectInterNodeNetworkMonkey
+  and not StopStartInterfacesNetworkMonkey
+  and not ClusterRollingRestart
+  and not ClusterRollingRestartRandomOrder
+  and not EnospcAllNodesMonkey
+  and not RollingRestartConfigChangeInternodeCompression
+  and not SwitchBetweenPasswordAuthAndSaslauthdAuth
+  and not ToggleAuditNemesisSyslog
+  and not ToggleAuditRulesNemesisSyslog
+  and not ToggleLdapConfiguration
+  )
