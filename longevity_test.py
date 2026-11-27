@@ -45,6 +45,7 @@ from sdcm.utils.common import skip_optional_stage
 from sdcm.utils.decorators import optional_stage
 from sdcm.utils.operations_thread import ThreadParams
 from sdcm.utils.parallel_object import ParallelObject
+from sdcm.utils.s3_cost import S3CostMeter
 
 # The name of the growth thread, and the name that reserves the joining nodes in the nemesis allocator.
 GROWTH_NAME = "GrowCluster"
@@ -205,7 +206,11 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         if tombstone_gc_verification_params := self._get_tombstone_gc_verification_params():
             self.run_tombstone_gc_verification_thread(**tombstone_gc_verification_params)
 
+        s3_cost = S3CostMeter.from_params(self.params, self.test_config.argus_client())
+        s3_cost.check()
+        s3_cost.start_phase("preload")
         self.run_prepare_write_cmd()
+        s3_cost.end_phase()
 
         # By default the cluster is grown before the main load starts. With `grow_cluster_during_stress`
         # the main load is started first and the nodes are added under it.
@@ -219,6 +224,7 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         stress_cmd = self.params.get("stress_cmd")
         stress_round_start = len(stress_queue)
+        s3_cost.start_phase("stress")
         self.assemble_and_run_all_stress_cmd(stress_queue, stress_cmd, keyspace_num)
         stress_round = stress_queue[stress_round_start:]
 
@@ -259,6 +265,8 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
 
         for stress in stress_queue:
             self.verify_stress_thread(stress)
+        s3_cost.end_phase()
+        s3_cost.report(settle=True)
 
         if self.partitions_attrs and self.partitions_attrs.validate_partitions:
             self.partitions_attrs.validate_rows_per_partitions(ignore_limit_rows_number=True)

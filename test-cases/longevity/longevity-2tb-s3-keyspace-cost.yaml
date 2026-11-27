@@ -1,0 +1,86 @@
+# One-off run for SCYLLADB-6199: S3 request and storage cost of a longevity test with keyspace1 on object storage.
+# longevity-100gb-4h-cql-stress.yaml scaled to 2 TB in the bucket, without nemesis.
+# Use with configurations/object_storage_s3.yaml (S3 endpoint in scylla.yaml).
+#
+# Dataset: 500M rows of 10 x 128 B (~1.35 KB on disk), RF=3 -> ~2 TB in the bucket, ~670 GB per node. An r8gd.xlarge has a 237 GB disk,
+# so the nodes cannot hold their share locally.
+# Phases that SCT prices from the CloudWatch request metrics of the keyspace1 bucket (Argus table
+# 'S3 object storage cost'):
+#   1. preload: prepare_write_cmd
+#   2. stress:  stress_cmd (4 h, one write and one read stream)
+# The bucket has request metrics enabled and nothing else may use it during the run.
+test_duration: 1800  # up to 24h (prepare, time not measured yet) + 4h for stress + 2h spare
+argus_use_ssh_tunnel: true
+test_metadata:
+  description: >-
+    One-off longevity run that measures the S3 cost of a keyspace on object storage: a 2 TB
+    preload on three r8gd.xlarge nodes, then 4 hours of write and read streams at QUORUM
+    without nemesis. SCT reports the S3 request and storage cost of each phase to Argus.
+  test_type: longevity
+  tier: ondemand
+  duration_class: long
+  supported_backends:
+    - aws
+  stress_tools:
+    - cql-stress-cassandra-stress
+
+# The bucket and its CloudWatch request metrics are in us-east-1.
+region_name: 'us-east-1'
+n_db_nodes: 3
+n_loaders: 2
+seeds_num: 3
+simulated_racks: 3
+
+instance_type_db: 'r8gd.xlarge'
+
+nemesis_class_name: 'NoOpMonkey'
+user_prefix: 'longevity-2tb-s3-cost'
+
+server_encrypt: true
+client_encrypt: true
+
+pre_create_keyspace: [
+  "CREATE KEYSPACE IF NOT EXISTS keyspace1 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '3'} AND storage = {'type': 'S3', 'bucket': 'jsmolar', 'endpoint': 's3.us-east-1.amazonaws.com'};",
+]
+pre_create_schema: True
+sstable_size: 100
+
+hinted_handoff: 'enabled'
+# One command per loader. Without it both loaders run both prepare commands and every row is written twice.
+round_robin: true
+
+prepare_write_cmd:
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM n=250000000
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..250000000
+    -col 'n=FIXED(10) size=FIXED(128)'
+    -log interval=5
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM n=250000000
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=250000001..500000000
+    -col 'n=FIXED(10) size=FIXED(128)'
+    -log interval=5
+
+stress_cmd:
+  - >-
+    cql-stress-cassandra-stress write cl=QUORUM duration=240m
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..500000000
+    -col 'n=FIXED(10) size=FIXED(128)'
+    -log interval=5
+  - >-
+    cql-stress-cassandra-stress read  cl=QUORUM duration=240m
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)'
+    -mode cql3 native
+    -rate threads=80
+    -pop seq=1..500000000
+    -col 'n=FIXED(10) size=FIXED(128)'
+    -log interval=5
