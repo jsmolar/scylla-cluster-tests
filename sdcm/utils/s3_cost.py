@@ -11,12 +11,13 @@
 #
 # Copyright (c) 2026 ScyllaDB
 
-"""S3 cost of a test, per test phase, reported to Argus.
+"""S3 requests of a test and their cost, per test phase, reported to the Costs tab of the Argus run.
 
-The requests come from the CloudWatch request metrics of the bucket, summed over each phase and
-priced with the S3 Standard list prices. The storage is the size of the bucket at the end of each
-phase. The numbers are bucket-wide, so the bucket must be used by this test only, and it must
-have a request-metrics configuration with the id `REQUEST_METRICS_ID` and no filter:
+The tab gets a section per phase, with one item per request family. The
+requests come from the CloudWatch request metrics of the bucket, summed over each phase. The cost
+is the requests at the S3 Standard list prices of us-east-1, which are constants here. The
+numbers are bucket-wide, so the bucket must be used by this test only, and it must have a
+request-metrics configuration with the id `REQUEST_METRICS_ID` and no filter:
 
     aws s3api put-bucket-metrics-configuration --bucket BUCKET --id EntireBucket \
         --metrics-configuration '{"Id": "EntireBucket"}'
@@ -30,56 +31,32 @@ from __future__ import annotations
 import functools
 import logging
 import re
-import time
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import boto3
 
-from argus.client.generic_result import ColumnMetadata, ResultType, StaticGenericResultTable, Status
+from argus.client.types import CostItem
+from sdcm.utils.cost_reporting import report_cost_items
 from sdcm.utils.object_storage import backup_bucket_region
 
 LOGGER = logging.getLogger(__name__)
 
 REQUEST_METRICS_ID = "EntireBucket"
 
-# S3 Standard list prices in us-east-1, USD. Traffic between EC2 and S3 of one region is free.
-PUT_CLASS_PRICE_PER_1K = 0.005
-GET_CLASS_PRICE_PER_1K = 0.0004
-STORAGE_PRICE_PER_GB_MONTH = 0.023
-
-PUT_CLASS_METRICS = ("PutRequests", "PostRequests", "ListRequests")  # PutRequests includes UploadPart
-GET_CLASS_METRICS = ("GetRequests", "HeadRequests", "SelectRequests")
-OTHER_METRICS = ("DeleteRequests", "AllRequests", "BytesUploaded", "BytesDownloaded")  # DELETE is free
-METRICS = (*PUT_CLASS_METRICS, *GET_CLASS_METRICS, *OTHER_METRICS)
+#: Request family, as S3 bills it -> its CloudWatch metrics and its S3 Standard list price per 1,000 requests, USD.
+REQUEST_FAMILIES = {
+    "PUT, POST, LIST": (("PutRequests", "PostRequests", "ListRequests"), 0.005),  # PutRequests has UploadPart
+    "GET, HEAD": (("GetRequests", "HeadRequests", "SelectRequests"), 0.0004),
+    "DELETE": (("DeleteRequests",), 0.0),
+}
+METRICS = tuple(metric for metrics, _ in REQUEST_FAMILIES.values() for metric in metrics)
 
 #: CloudWatch gets the request metrics of a minute a few minutes after it ended.
 METRICS_DELAY = 300
-TOTAL_ROW = "total"
 #: The bucket of `storage = {'type': 'S3', 'bucket': 'NAME', ...}` in a CREATE KEYSPACE statement.
 S3_KEYSPACE_BUCKET = re.compile(r"'type'\s*:\s*'S3'\s*,\s*'bucket'\s*:\s*'([^']+)'")
-GIB = 2**30  # S3 bills the storage per GB of 2^30 bytes
-
-
-class S3CostResult(StaticGenericResultTable):
-    class Meta:
-        name = "S3 object storage cost"
-        description = (
-            "S3 requests of the bucket per test phase (CloudWatch request metrics) at the S3 Standard list "
-            "prices, and the size of the bucket at the end of the phase"
-        )
-        Columns = [
-            ColumnMetadata(name="duration", unit="HH:MM:SS", type=ResultType.DURATION),
-            ColumnMetadata(name="PUT, POST, LIST requests", unit="", type=ResultType.INTEGER),
-            ColumnMetadata(name="GET, HEAD requests", unit="", type=ResultType.INTEGER),
-            ColumnMetadata(name="DELETE requests", unit="", type=ResultType.INTEGER),
-            ColumnMetadata(name="uploaded", unit="GiB", type=ResultType.FLOAT),
-            ColumnMetadata(name="downloaded", unit="GiB", type=ResultType.FLOAT),
-            ColumnMetadata(name="request cost", unit="USD", type=ResultType.FLOAT),
-            ColumnMetadata(name="request cost per hour", unit="USD/h", type=ResultType.FLOAT),
-            ColumnMetadata(name="bucket size", unit="GiB", type=ResultType.FLOAT),
-            ColumnMetadata(name="storage cost", unit="USD/month", type=ResultType.FLOAT),
-        ]
 
 
 @dataclass
@@ -87,34 +64,36 @@ class Phase:
     name: str
     start: datetime
     end: datetime | None = None
-    bucket_bytes: int | None = None
+    #: CloudWatch metric name -> sum over the phase, set when the phase is reported.
+    sums: dict[str, float] | None = None
 
 
-def request_cost(sums: dict[str, float]) -> float:
-    """USD for the requests in `sums`, a CloudWatch metric name -> number of requests mapping."""
-    put_class = sum(sums.get(metric, 0) for metric in PUT_CLASS_METRICS)
-    get_class = sum(sums.get(metric, 0) for metric in GET_CLASS_METRICS)
-    return put_class / 1000 * PUT_CLASS_PRICE_PER_1K + get_class / 1000 * GET_CLASS_PRICE_PER_1K
+def cost_items(phases: list[Phase]) -> list[CostItem]:
+    """Items for the Costs tab of Argus, which shows them as a section per reported phase.
 
+    The number of requests goes to the pricing tier of the item, the only free column of the tab.
+    Argus keys an item by its name, and the sections have the same item names. So the name of an
+    item of the section number N ends with N spaces, which a browser does not show.
 
-def phase_row(start: datetime, end: datetime, sums: dict[str, float], bucket_bytes: int | None) -> dict:
-    """Values of one `S3CostResult` row, by column name."""
-    seconds = (end - start).total_seconds()
-    cost = request_cost(sums)
-    row = {
-        "duration": int(seconds),
-        "PUT, POST, LIST requests": int(sum(sums.get(metric, 0) for metric in PUT_CLASS_METRICS)),
-        "GET, HEAD requests": int(sum(sums.get(metric, 0) for metric in GET_CLASS_METRICS)),
-        "DELETE requests": int(sums.get("DeleteRequests", 0)),
-        "uploaded": round(sums.get("BytesUploaded", 0) / GIB, 2),
-        "downloaded": round(sums.get("BytesDownloaded", 0) / GIB, 2),
-        "request cost": round(cost, 2),
-        "request cost per hour": round(cost / (seconds / 3600), 2) if seconds > 0 else 0.0,
-    }
-    if bucket_bytes is not None:
-        row["bucket size"] = round(bucket_bytes / GIB, 2)
-        row["storage cost"] = round(bucket_bytes / GIB * STORAGE_PRICE_PER_GB_MONTH, 2)
-    return row
+    Example of a section (item, pricing tier, cost):
+        S3 preload                            $13.93
+        DELETE             771,957             $0.00
+        GET, HEAD          2,355,410           $0.94
+        PUT, POST, LIST    2,597,299          $12.99
+    """
+    items = []
+    for order, phase in enumerate(phases):
+        for family, (metrics, price) in REQUEST_FAMILIES.items():
+            requests = int(sum(phase.sums[metric] for metric in metrics))
+            items.append(
+                CostItem(
+                    name=family + " " * order,
+                    category=f"s3_{phase.name}",
+                    cost=round(requests / 1000 * price, 4),
+                    pricing_tier=f"{requests:,}",
+                )
+            )
+    return items
 
 
 def _advisory(method):
@@ -127,14 +106,14 @@ def _advisory(method):
         try:
             return method(self, *args, **kwargs)
         except Exception:  # noqa: BLE001
-            LOGGER.warning("S3 cost of bucket '%s': %s failed", self.bucket, method.__name__, exc_info=True)
+            LOGGER.warning("S3 usage of bucket '%s': %s failed", self.bucket, method.__name__, exc_info=True)
             return None
 
     return wrapper
 
 
 class S3CostMeter:
-    """Measures the S3 cost of a bucket per test phase and sends it to Argus.
+    """Measures the S3 usage of a bucket per test phase and sends it to Argus.
 
     Without a bucket every method does nothing, so a test calls it without a condition.
 
@@ -144,7 +123,7 @@ class S3CostMeter:
         meter.start_phase("preload")
         ...
         meter.end_phase()
-        meter.report(settle=True)
+        meter.wait()
     """
 
     def __init__(self, bucket: str | None, region: str | None = None, argus_client=None):
@@ -152,6 +131,7 @@ class S3CostMeter:
         self.region = region
         self.argus_client = argus_client
         self.phases: list[Phase] = []
+        self._reports: list[threading.Timer] = []
 
     @classmethod
     def from_params(cls, params, argus_client) -> S3CostMeter:
@@ -173,51 +153,44 @@ class S3CostMeter:
     def check(self) -> None:
         """Fail early, in the log, when the runner cannot read what the report needs."""
         self._s3.get_bucket_metrics_configuration(Bucket=self.bucket, Id=REQUEST_METRICS_ID)
-        self._s3.list_objects_v2(Bucket=self.bucket, MaxKeys=1)
         now = datetime.now(tz=UTC)
         self._request_sums(now - timedelta(minutes=5), now)
-        LOGGER.info("S3 cost of bucket '%s' (%s) will be reported to Argus", self.bucket, self.region)
+        LOGGER.info("S3 usage of bucket '%s' (%s) will be reported to Argus", self.bucket, self.region)
 
     @_advisory
     def start_phase(self, name: str) -> None:
         phase = Phase(name=name, start=datetime.now(tz=UTC))
         self.phases.append(phase)
-        LOGGER.info("S3 cost of bucket '%s': phase '%s' started at %s", self.bucket, name, phase.start.isoformat())
+        LOGGER.info("S3 usage of bucket '%s': phase '%s' started at %s", self.bucket, name, phase.start.isoformat())
 
     @_advisory
     def end_phase(self) -> None:
-        """Close the last phase, record the size of the bucket, and send what is known so far."""
+        """Close the last phase and report it in `METRICS_DELAY` seconds, when CloudWatch has its last minutes.
+
+        The report waits in the background, so the next phase starts at once.
+        """
         phase = self.phases[-1]
+        if phase.end:
+            return
         phase.end = datetime.now(tz=UTC)
-        # Logged before anything that can fail, so the report can be rebuilt from CloudWatch by hand.
-        LOGGER.info("S3 cost of bucket '%s': phase '%s' ended at %s", self.bucket, phase.name, phase.end.isoformat())
-        phase.bucket_bytes = self._bucket_bytes()
-        LOGGER.info("S3 cost of bucket '%s': %s bytes at the end of '%s'", self.bucket, phase.bucket_bytes, phase.name)
-        self.report()
+        LOGGER.info("S3 usage of bucket '%s': phase '%s' ended at %s", self.bucket, phase.name, phase.end.isoformat())
+        report = threading.Timer(METRICS_DELAY, self._report, args=(phase,))
+        report.daemon = True
+        report.start()
+        self._reports.append(report)
 
     @_advisory
-    def report(self, settle: bool = False) -> None:
-        """Send one row per finished phase, and a total row from the first start to the last end.
+    def wait(self) -> None:
+        """Wait for the reports of all the ended phases: call it before the test ends."""
+        for report in self._reports:
+            report.join()
 
-        A row replaces the one sent before, so the last minutes of a phase, which CloudWatch did not
-        have yet, are filled in by the next report. `settle` waits for them first: use it for the
-        last report of the test.
-        """
-        finished = [phase for phase in self.phases if phase.end]
-        if not finished or not self.argus_client:
-            return
-        if settle:
-            time.sleep(METRICS_DELAY)
-        table = S3CostResult()
-        rows = [(phase.name, phase.start, phase.end, phase.bucket_bytes) for phase in finished]
-        if len(finished) > 1:
-            rows.append((TOTAL_ROW, finished[0].start, finished[-1].end, finished[-1].bucket_bytes))
-        for name, start, end, bucket_bytes in rows:
-            values = phase_row(start, end, self._request_sums(start, end), bucket_bytes)
-            LOGGER.info("S3 cost of bucket '%s', %s: %s", self.bucket, name, values)
-            for column, value in values.items():
-                table.add_result(column=column, row=name, value=value, status=Status.UNSET)
-        self.argus_client.submit_results(table)
+    @_advisory
+    def _report(self, phase: Phase) -> None:
+        phase.sums = self._request_sums(phase.start, phase.end)
+        LOGGER.info("S3 usage of bucket '%s', %s: %s", self.bucket, phase.name, phase.sums)
+        if self.argus_client:
+            report_cost_items(self.argus_client, cost_items([phase for phase in self.phases if phase.sums]))
 
     def _request_sums(self, start: datetime, end: datetime) -> dict[str, float]:
         """Sum of every request metric over the 1-minute datapoints from `start` to `end`."""
@@ -245,9 +218,3 @@ class S3CostMeter:
             for result in page["MetricDataResults"]:
                 sums[METRICS[int(result["Id"][1:])]] += sum(result["Values"])
         return sums
-
-    def _bucket_bytes(self) -> int:
-        size = 0
-        for page in self._s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket):
-            size += sum(obj["Size"] for obj in page.get("Contents", []))
-        return size

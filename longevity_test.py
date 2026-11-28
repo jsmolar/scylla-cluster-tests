@@ -266,7 +266,7 @@ class LongevityTest(ClusterTester, loader_utils.LoaderUtilsMixin):
         for stress in stress_queue:
             self.verify_stress_thread(stress)
         s3_cost.end_phase()
-        s3_cost.report(settle=True)
+        s3_cost.wait()
 
         if self.partitions_attrs and self.partitions_attrs.validate_partitions:
             self.partitions_attrs.validate_rows_per_partitions(ignore_limit_rows_number=True)
